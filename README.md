@@ -337,32 +337,6 @@ PhD Candidate, Central South University, Changsha, China
 <div align="center">
   <sub>Built with Python • Analysis for <em>Applied Soft Computing</em> • Last updated: October 2026</sub>
 </div>
-```
 
----
 
-## Summary of Changes
-
-| Item | Before | After |
-|---|---|---|
-| **Title** | "Multi-Objective Optimization of Low-Carbon Container Routing Using PA-NSGA-II" | "DRO-EMO: Distributionally Robust Multi-Objective Evolutionary Optimization for Low-Carbon Container Routing" |
-| **Journal** | *Computational Optimization and Applications* (Under Review) | *Applied Soft Computing* (under review) |
-| **Method name** | PA-NSGA-II | DRO-EMO |
-| **Fitness function** | Pareto search with adaptive operators | Moment-based distributionally robust bound |
-| **Components** | Adaptive-PPO, Size-Adaptive Config, PA-NSGA-II | Joint DRO bound, Diversity-adaptive operator control, Periodic local search, PPO-guided seeding |
-| **Win rate** | 83.3% (20/24) | 21/24 top-ranked, 24/24 first-or-second |
-| **Mean HV** | 1.85 × 10¹¹ (mixed with other tables) | 0.9412 over 24 instances (matches `tab:prins_hv`) |
-| **Corridor baseline** | "356 kg CO₂ (PA-NSGA-II), 576 kg (NSGA-II)" — inconsistent with manuscript | 1,596.07 kg CO₂, $832.93, 82.05 h — matches `tab:alt_paths` |
-| **Carbon-price table** | Mixed PA-NSGA-II/NSGA-II/SPEA2 results | Aligned with `tab:econ_sensitivity` (mean HV, best CO₂, best cost) |
-| **Seasonal table** | Mixed columns | Aligned with `tab:oper_sensitivity` |
-| **Effect size** | Cohen's d = 0.55 | Cohen's d between 1.21 and 1.94 (matches `tab:prins_stats`) |
-| **PPO framing** | "Initialization matters" (positive result) | "Not statistically significant" (honest negative result, matching ablation) |
-| **Repository name** | `PA-NSGA-II-4-LC-CTRP` | `DRO-EMO-LC-CTRP` |
-| **File list** | Files with spaces in names (`COMPREHENSIVE BENCHMARK ANALYSIS.py`) | Clean names (`run_prins_benchmark.py`) |
-| **Figure names** | `Fig1_Baseline_Performance.pdf` … `Fig13_3D_Objective_Space.pdf` | Renamed to match the main manuscript figure references (`Figure_1_Corridor_Map.jpg` … `Figure_11_Heatmap.png`) |
-| **Dependencies** | numpy>=1.21, pandas>=1.3, Python 3.9+ | numpy>=2.3.5, pandas>=2.3.3, Python 3.11+ (matches `sec:env_setup`) |
-| **Citation key** | `Ndikuriyo2026` | `Ndikuriyo2026DROEMO` with the correct title and journal |
-| **Date** | June 2026 | October 2026 |
-
----
 
