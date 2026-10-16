@@ -1,0 +1,1204 @@
+# ============================================================================
+# Self-contained ablation cell with size-class breakdown.
+# ============================================================================
+import os, sys, time, random
+import numpy as np
+import pandas as pd
+from datetime import datetime
+from scipy import stats
+from dataclasses import dataclass, field, replace
+
+# ---- Paths ----
+INPUT_EXCEL = (
+    r"D:\Container Transportation Routing Problems\Manuscript3-A Low-carbon "
+    r"based Robust Optimization under uncertainty"
+    r"\Dataset - Prins LRP original instances and adapted instances.xlsx"
+)
+OUTPUT_BASE_DIR = (
+    r"D:\Container Transportation Routing Problems\Manuscript3-A Low-carbon "
+    r"based Robust Optimization under uncertainty"
+    r"\DRO-EMO on Prins Routing Benchmarks"
+)
+ABLATION_DIR = os.path.join(OUTPUT_BASE_DIR, "ablation")
+os.makedirs(ABLATION_DIR, exist_ok=True)
+
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+# ============================================================================
+# MODEL / EVALUATOR / DROEMO  (verbatim from your working ablation cell)
+# ============================================================================
+@dataclass
+class RoutingModelParams:
+    vehicle_capacity: float = 70.0
+    vehicle_fixed_cost: float = 1000.0
+    carbon_treatment_cost: float = 0.354
+    emission_coefficient: float = 2.63
+    diesel_unit_cost: float = 7.51
+    diesel_cons_empty: float = 0.12385
+    diesel_cons_full: float = 0.13641
+    electricity_unit_cost: float = 0.72
+    elec_cons_empty: float = 0.32456
+    elec_cons_full: float = 0.421928
+    ev_battery_max: float = 41.0
+    avg_speed_kmh: float = 40.0
+    service_time_h: float = 0.1
+    fixed_depot_emission: float = 0.0
+
+
+class PrinsInstance:
+    def __init__(self, sheet_name, df):
+        self.name = sheet_name
+        self.raw = df
+        self.is_green = sheet_name.startswith("G")
+        self.depots = {}; self.customers = {}
+        self.vehicle_capacity = 70.0
+        self.vehicle_fixed_cost = 1000.0
+        self.params = RoutingModelParams()
+        self._parse(df)
+
+    def _parse(self, df):
+        rows = df.values.tolist()
+        data_rows = rows[1:] if len(rows) > 1 else rows
+        for row in data_rows:
+            if len(row) < 4: continue
+            label = row[0]
+            if label is None: continue
+            label_s = str(label).strip()
+            if not label_s.lower().startswith("d"): continue
+            try:
+                x = float(row[1]); y = float(row[2])
+                cap = float(row[3]) if row[3] not in (None, "", " ") else 0.0
+            except (ValueError, TypeError): continue
+            try:
+                oc = float(row[4]) if len(row) > 4 and row[4] not in (None,""," ") else 0.0
+            except (ValueError, TypeError): oc = 0.0
+            fe = 0.0
+            if self.is_green and len(row) > 5 and row[5] not in (None,""," "):
+                try:
+                    v = row[5]
+                    fe = oc/10.0 if isinstance(v,str) and v.startswith("=") else float(v)
+                except (ValueError, TypeError): fe = oc/10.0
+            if label_s not in self.depots:
+                self.depots[label_s] = {"x": x, "y": y, "capacity": cap,
+                                        "opening_cost": oc, "fixed_emission": fe}
+        prev_id = 0
+        for row in data_rows:
+            if len(row) < 4: continue
+            label = row[0]
+            if label is None: continue
+            label_s = str(label).strip()
+            if label_s.lower().startswith("d"): continue
+            try: cid = int(float(label_s))
+            except (ValueError, TypeError): continue
+            if cid <= prev_id: continue
+            try:
+                x = float(row[1]); y = float(row[2])
+                dem = float(row[3]) if row[3] not in (None,""," ") else 0.0
+            except (ValueError, TypeError): continue
+            self.customers[str(cid)] = {"x": x, "y": y, "demand": dem}
+            prev_id = cid
+        for row in data_rows:
+            for j, cell in enumerate(row):
+                if cell is None: continue
+                s = str(cell).strip().lower()
+                if s == "vehicle capacity":
+                    for k in range(j+1, len(row)):
+                        if row[k] not in (None,""," "):
+                            try: self.vehicle_capacity = float(str(row[k]).split("/")[0])
+                            except (ValueError, TypeError): pass
+                            break
+                if s == "opening cost of a route (cost of a vehicle)":
+                    for k in range(j+1, len(row)):
+                        if row[k] not in (None,""," "):
+                            try: self.vehicle_fixed_cost = float(row[k])
+                            except (ValueError, TypeError): pass
+                            break
+
+    @property
+    def n_depots(self): return len(self.depots)
+    @property
+    def n_customers(self): return len(self.customers)
+    @property
+    def n_var(self): return self.n_customers
+    @property
+    def n_obj(self): return 3
+
+
+def load_prins_instances(excel_path):
+    if not os.path.isfile(excel_path):
+        raise FileNotFoundError(excel_path)
+    xls = pd.ExcelFile(excel_path)
+    out = []
+    for sheet in xls.sheet_names:
+        try:
+            df = pd.read_excel(excel_path, sheet_name=sheet, header=None)
+            inst = PrinsInstance(sheet, df)
+            if inst.n_depots == 0 or inst.n_customers == 0: continue
+            out.append(inst)
+        except Exception as e:
+            log(f"  [skip] {sheet}: {e}")
+    return out
+
+
+@dataclass
+class AmbiguitySet:
+    W_lower: np.ndarray; W_upper: np.ndarray
+    mean_hat: np.ndarray; mean_lower: np.ndarray; mean_upper: np.ndarray
+    Sigma: np.ndarray; sigma_f: np.ndarray; sigma_b: np.ndarray
+    H_sigma: np.ndarray
+    @staticmethod
+    def from_residuals(residuals, confidence=0.95):
+        residuals = np.atleast_2d(residuals)
+        n, d = residuals.shape
+        W_lower = residuals.min(axis=0); W_upper = residuals.max(axis=0)
+        mean_hat = residuals.mean(axis=0)
+        std = residuals.std(axis=0, ddof=1) if n > 1 else np.zeros(d)
+        z = stats.norm.ppf((1+confidence)/2)
+        margin = z*std/np.sqrt(max(n,1))
+        mean_lower = mean_hat - margin; mean_upper = mean_hat + margin
+        Sigma = np.cov(residuals, rowvar=False) if n > 1 else np.eye(d)
+        if Sigma.ndim == 0: Sigma = np.array([[float(Sigma)]])
+        Sigma = 0.9*Sigma + 0.1*np.diag(np.diag(Sigma)) + 1e-8*np.eye(d)
+        sigma_f = AmbiguitySet._dd(residuals, +1)
+        sigma_b = AmbiguitySet._dd(residuals, -1)
+        eigvals, eigvecs = np.linalg.eigh(Sigma)
+        eigvals = np.clip(eigvals, 1e-10, None)
+        H = (eigvecs / np.sqrt(eigvals)).T
+        return AmbiguitySet(W_lower, W_upper, mean_hat, mean_lower,
+                            mean_upper, Sigma, sigma_f, sigma_b, H)
+    @staticmethod
+    def _dd(residuals, sign):
+        theta_grid = np.logspace(-3, 1, 40)
+        r = sign * residuals
+        n, d = r.shape
+        out = np.zeros(d)
+        for j in range(d):
+            x = r[:, j]
+            zz = theta_grid[:, None] * x[None, :]
+            m = zz.max(axis=1)
+            lme = m + np.log(np.mean(np.exp(zz - m[:, None]), axis=1))
+            val = np.sqrt(np.maximum(2.0*lme/theta_grid**2, 0.0))
+            out[j] = float(val.max())
+        return out
+
+
+class DROEvaluator:
+    _LAM_GRID = np.logspace(-3, 2, 60)
+    def __init__(self, amb):
+        self.amb = amb; self._cache = {}
+    def _coeffs(self, r):
+        key = r.tobytes(); c = self._cache.get(key)
+        if c is not None: return c
+        wm = float(np.sum(np.where(r>=0, r*self.amb.mean_upper, r*self.amb.mean_lower)))
+        ws = float(np.sum(np.where(r>=0, r*self.amb.W_upper, r*self.amb.W_lower)))
+        u = np.maximum(r*self.amb.sigma_f, -r*self.amb.sigma_b)
+        nu2 = float(u @ u)
+        var = max(float(r @ self.amb.Sigma @ r), 0.0)
+        c = (wm, ws, nu2, var)
+        if len(self._cache) > 4096: self._cache.clear()
+        self._cache[key] = c
+        return c
+    def pi1(self, r0, r):
+        r = np.asarray(r, dtype=float).flatten()
+        wm, ws, _, _ = self._coeffs(r)
+        return max(0.0, r0 + max(ws, wm))
+    def pi2(self, r0, r):
+        r = np.asarray(r, dtype=float).flatten()
+        wm, _, _, var = self._coeffs(r)
+        mu = r0 + wm
+        return (0.5*mu + 0.5*np.sqrt(mu**2 + var)) if mu >= 0 else 0.5*np.sqrt(var)
+    def pi3(self, r0, r):
+        r = np.asarray(r, dtype=float).flatten()
+        wm, ws, nu2, _ = self._coeffs(r)
+        x0 = r0 + wm; sup_z = ws
+        lams = self._LAM_GRID
+        e = (x0 + sup_z)/lams + nu2/(2.0*lams**2)
+        log_v = np.log(lams) - 1.0 + e
+        v = np.exp(np.minimum(log_v, 700.0))
+        v = np.where(e > 50.0, np.inf, v)
+        if not np.any(np.isfinite(v)): return self.pi1(r0, r)
+        return float(np.min(v))
+    def pi(self, r0, r):
+        return max(self.pi1(r0, r), self.pi2(r0, r), self.pi3(r0, r))
+
+
+class LCCLRP:
+    def __init__(self, instance, evaluation_mode='dro'):
+        self.instance = instance
+        self.n_var = instance.n_customers
+        self.n_obj = 3
+        self.evaluation_mode = evaluation_mode
+        self.depot_list = list(instance.depots.keys())
+        self.customer_list = list(instance.customers.keys())
+        pts = [(instance.depots[d]["x"], instance.depots[d]["y"]) for d in self.depot_list]
+        pts += [(instance.customers[c]["x"], instance.customers[c]["y"]) for c in self.customer_list]
+        pts = np.array(pts, dtype=float)
+        self.D = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+        self.n_depots = instance.n_depots
+        self.n_customers = instance.n_customers
+        self._demands = np.array([instance.customers[c]["demand"] for c in self.customer_list], dtype=float)
+        self._depot_caps = np.array([instance.depots[d]["capacity"] for d in self.depot_list], dtype=float)
+        self._depot_open_cost = np.array([instance.depots[d]["opening_cost"] for d in self.depot_list], dtype=float)
+        self._depot_fixed_em = np.array([instance.depots[d].get("fixed_emission",0.0) for d in self.depot_list], dtype=float)
+        self._build_ambiguity_set()
+        self.dro = DROEvaluator(self.ambiguity)
+    def _build_ambiguity_set(self):
+        dm = np.array([0.85,0.95,1.00,1.05,1.15])
+        tm = np.array([0.90,0.95,1.00,1.10,1.30])
+        em = np.array([0.95,0.98,1.00,1.02,1.05])
+        probs = np.array([0.15,0.20,0.30,0.20,0.15]); probs = probs/probs.sum()
+        res = np.column_stack([dm-1, tm-1, em-1])
+        rng = np.random.default_rng(hash(self.instance.name) % 2**32)
+        idx = rng.choice(len(res), size=max(50, len(res)*20), p=probs, replace=True)
+        self.ambiguity = AmbiguitySet.from_residuals(res[idx], 0.95)
+    def _decode(self, x):
+        x = np.clip(np.asarray(x, dtype=float), 0, 1)
+        flags = x[:self.n_depots] >= 0.5
+        if not np.any(flags): flags[np.argmax(x[:self.n_depots])] = True
+        open_depots = [i for i, f in enumerate(flags) if f]
+        og = x[self.n_depots:self.n_depots + self.n_customers]
+        if len(og) < self.n_customers:
+            og = np.pad(og, (0, self.n_customers - len(og)), constant_values=0.5)
+        order = np.argsort(og)
+        caps = {d: self._depot_caps[d] for d in open_depots}
+        demands = self._demands; Dloc = self.D; n_dep = self.n_depots
+        vcap = self.instance.vehicle_capacity
+        routes = []
+        for c in order:
+            dem = demands[c]
+            best_d, best_dist = None, np.inf
+            for d in open_depots:
+                if caps[d] < dem: continue
+                dd = Dloc[d, n_dep + c]
+                if dd < best_dist: best_dist = dd; best_d = d
+            if best_d is None: best_d = max(open_depots, key=lambda d: caps[d])
+            placed = False
+            for r_i, (dep, seq, load) in enumerate(routes):
+                if dep != best_d: continue
+                if load + dem <= vcap:
+                    seq.append(c); routes[r_i] = (dep, seq, load + dem)
+                    placed = True; break
+            if not placed: routes.append((best_d, [c], dem))
+            caps[best_d] -= dem
+        route_nodes = [(dep, [n_dep + c for c in seq]) for dep, seq, _ in routes]
+        return open_depots, route_nodes
+    def _nominal_evaluate(self, x, return_L=False):
+        try: open_depots, routes = self._decode(x)
+        except Exception:
+            return (1e10,1e10,1e10,0.0) if return_L else (1e10,1e10,1e10)
+        depot_cost = float(self._depot_open_cost[open_depots].sum()) if open_depots else 0.0
+        depot_em = float(self._depot_fixed_em[open_depots].sum()) if open_depots else 0.0
+        d_cost = 0.0; d_em = 0.0; t_tot = 0.0; veh_fix = 0.0
+        p = self.instance.params; Dloc = self.D; n_dep = self.n_depots
+        demands = self._demands; vcap = max(self.instance.vehicle_capacity, 1.0)
+        for dep, seq in routes:
+            veh_fix += self.instance.vehicle_fixed_cost
+            path = [dep] + seq + [dep]
+            load = sum(demands[c-n_dep] for c in seq)
+            for i in range(len(path)-1):
+                a, b = path[i], path[i+1]
+                dkm = Dloc[a, b]; lf = load/vcap
+                fpk = p.diesel_cons_empty + (p.diesel_cons_full - p.diesel_cons_empty)*lf
+                d_cost += fpk*dkm*p.diesel_unit_cost
+                d_em += fpk*dkm*p.emission_coefficient
+                t_tot += dkm/p.avg_speed_kmh
+                if b >= n_dep:
+                    ci = b - n_dep
+                    load -= demands[ci]
+                    if load < 0: load = 0
+            t_tot += p.service_time_h*len(seq)
+        carbon_cost = p.carbon_treatment_cost * d_em
+        res = (float(depot_cost + veh_fix + d_cost + carbon_cost),
+               float(depot_em + d_em), float(t_tot))
+        if return_L:
+            L_total = 0.0
+            for dep, seq in routes:
+                path = [dep] + seq + [dep]
+                L_total += float(sum(Dloc[path[i], path[i+1]] for i in range(len(path)-1)))
+            return res, L_total
+        return res
+    def _exact_sensitivities(self, x, L_total):
+        p = self.instance.params
+        b_time_tau = L_total / p.avg_speed_kmh
+        b_em_gamma = L_total * p.emission_coefficient
+        total_demand = float(self._demands.sum()) if self._demands.size else 1.0
+        dL = L_total / max(total_demand, 1.0)
+        b_cost_d = dL * p.diesel_unit_cost * (p.diesel_cons_empty + p.diesel_cons_full)/2.0
+        b_cost_gamma = L_total * p.emission_coefficient * p.carbon_treatment_cost
+        return (np.nan_to_num(np.array([b_cost_d, 0.0, b_cost_gamma])),
+                np.nan_to_num(np.array([0.0, 0.0, b_em_gamma])),
+                np.nan_to_num(np.array([0.0, b_time_tau, 0.0])))
+    def evaluate(self, x):
+        (bc, be, bt), L_total = self._nominal_evaluate(x, return_L=True)
+        if self.evaluation_mode == 'deterministic':
+            return (float(bc), float(be), float(bt))
+        b_cost, b_em, b_time = self._exact_sensitivities(x, L_total)
+        return (float(self.dro.pi(bc, b_cost)),
+                float(self.dro.pi(be, b_em)),
+                float(self.dro.pi(bt, b_time)))
+    def evaluate_deterministic(self, x):
+        return self._nominal_evaluate(x)
+
+
+@dataclass
+class DROEMOConfig:
+    ppo_learning_rate: float = 3e-4
+    ppo_clip_epsilon: float = 0.2
+    ppo_gamma: float = 0.99
+    ppo_gae_lambda: float = 0.95
+    ppo_training_episodes: int = 2000
+    ppo_proportion: float = 0.30
+    heuristic_proportion: float = 0.30
+    random_proportion: float = 0.30
+    opposite_proportion: float = 0.10
+    exploitation_base: float = 0.85
+    exploration_base: float = 0.15
+    local_search_frequency: int = 10
+    local_search_top_proportion: float = 0.10
+    local_search_epsilon: float = 0.02
+    local_search_iterations: int = 40
+    archive_size_ratio: float = 0.5
+    diversity_reset_threshold: float = 0.15
+    diversity_reset_min_interval: int = 20
+    diversity_reset_proportion: float = 0.15
+    hv_stride: int = 5
+    use_dro_bound: bool = True
+    use_ppo_init: bool = True
+    use_adaptive_operators: bool = True
+    use_local_search: bool = True
+    def get_generations(self, n):
+        if n <= 30: return 150
+        if n <= 60: return 120
+        if n <= 120: return 100
+        return 90
+    def get_population(self, n):
+        if n <= 30: return 60
+        if n <= 60: return 80
+        if n <= 120: return 100
+        return 100
+
+
+class PPOAgent:
+    def __init__(self, sd, ad, cfg):
+        self.sd = sd; self.ad = ad
+        self.pw = np.random.randn(sd, ad)*0.01
+        self.vw = np.random.randn(sd, 1)*0.01
+        self.opw = self.pw.copy()
+        self.lr = cfg.ppo_learning_rate
+        self.ce = cfg.ppo_clip_epsilon
+        self.ga = cfg.ppo_gamma; self.gl = cfg.ppo_gae_lambda
+    def get_action(self, s, bf=0.0, ew=None):
+        if s.ndim > 1: s = s.flatten()
+        s = np.pad(s, (0, max(0, self.sd - len(s))))[:self.sd]
+        lg = s @ self.pw
+        if ew is not None and bf > 0:
+            ew = np.pad(ew, (0, max(0, len(lg)-len(ew))))[:len(lg)]
+            lg = lg - bf*ew
+        p = self._sm(lg); p = np.nan_to_num(p, nan=1.0/self.ad)
+        p = p / max(p.sum(), 1e-10)
+        a = np.random.choice(self.ad, p=p); return a, p[a]
+    def update(self, S, A, R, NS, D):
+        if S.ndim == 1: S = S.reshape(1, -1)
+        if NS.ndim == 1: NS = NS.reshape(1, -1)
+        if S.shape[1] < self.sd:
+            pad = ((0,0),(0,self.sd-S.shape[1])); S = np.pad(S, pad); NS = np.pad(NS, pad)
+        else: S = S[:, :self.sd]; NS = NS[:, :self.sd]
+        aoh = np.zeros((len(A), self.ad)); aoh[np.arange(len(A)), A] = 1
+        v = S @ self.vw; nv = NS @ self.vw
+        dl = R + self.ga*(1-D)*nv.flatten() - v.flatten()
+        dl = np.nan_to_num(dl, nan=0.0)
+        adv = np.zeros_like(dl); a = 0
+        for t in reversed(range(len(dl))):
+            a = dl[t] + self.ga*self.gl*(1-D[t])*a; adv[t] = a
+        if len(adv) > 1 and np.std(adv) > 1e-8:
+            adv = (adv - adv.mean())/adv.std()
+        op = self._sm(S @ self.opw); oa = op[np.arange(len(A)), A] + 1e-8
+        np_ = self._sm(S @ self.pw); na = np_[np.arange(len(A)), A] + 1e-8
+        ratio = np.nan_to_num(na/oa, nan=1.0, posinf=1+self.ce, neginf=1-self.ce)
+        cl = np.clip(ratio, 1-self.ce, 1+self.ce)
+        obj = np.minimum(ratio*adv, cl*adv)
+        g = S.T @ ((obj[:, None]*(aoh-np_))/np_)
+        self.pw += self.lr*np.nan_to_num(g, nan=0.0)
+        td = R + self.ga*(1-D)*(NS @ self.vw).flatten() - v.flatten()
+        self.vw += self.lr*S.T @ np.nan_to_num(td, nan=0.0)[:, None]
+        self.opw = self.pw.copy()
+        return float(np.mean(obj)) if len(obj) else 0.0
+    def _sm(self, x):
+        x = np.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+        e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return e / np.maximum(np.sum(e, axis=-1, keepdims=True), 1e-10)
+
+
+def _dominates(a, b):
+    one = False
+    for ai, bi in zip(a, b):
+        if ai > bi: return False
+        if ai < bi: one = True
+    return one
+
+def _epsilon_dominates(a, b, eps):
+    sb = False
+    for ai, bi in zip(a, b):
+        if ai > bi + eps: return False
+        if ai < bi - eps: sb = True
+    return sb
+
+def non_dominated_sort(fit):
+    n = len(fit)
+    if n == 0: return []
+    dom = [set() for _ in range(n)]; dc = [0]*n
+    for i in range(n):
+        for j in range(i+1, n):
+            if _dominates(fit[i], fit[j]): dom[i].add(j); dc[j] += 1
+            elif _dominates(fit[j], fit[i]): dom[j].add(i); dc[i] += 1
+    front = [i for i in range(n) if dc[i] == 0]
+    fronts = [list(front)]
+    while front:
+        nxt = []
+        for i in front:
+            for j in dom[i]:
+                dc[j] -= 1
+                if dc[j] == 0: nxt.append(j)
+        front = nxt
+        if front: fronts.append(list(front))
+    return fronts
+
+def crowding_distance(fit, idx):
+    m = len(fit[0]); n = len(idx)
+    if n == 0: return np.array([])
+    if n <= 2: return np.full(n, np.inf)
+    d = np.zeros(n)
+    for k in range(m):
+        vals = np.array([fit[i][k] for i in idx])
+        order = np.argsort(vals)
+        d[order[0]] = np.inf; d[order[-1]] = np.inf
+        rng = vals[order[-1]] - vals[order[0]]
+        if rng <= 1e-12: continue
+        for i in range(1, n-1):
+            d[order[i]] += (vals[order[i+1]] - vals[order[i-1]])/rng
+    return d
+
+
+class DROEMO:
+    def __init__(self, problem, cfg):
+        self.problem = problem; self.cfg = cfg
+        self.pop_size = cfg.get_population(problem.n_var)
+        self.max_gen = cfg.get_generations(problem.n_var)
+        self.n_var = problem.n_var; self.n_obj = problem.n_obj
+        sd = min(self.n_var + 4, 50); ad = min(self.n_var*3, 100)
+        self.ppo = PPOAgent(sd, ad, cfg)
+        if cfg.use_ppo_init: self._pretrain()
+        self.population = []; self.fitness = []
+        self.archive = []
+        self._last_reset = -9999
+        self._eval_cache = {}
+    def _pretrain(self):
+        for _ in range(min(20, self.cfg.ppo_training_episodes//10)):
+            bs = 5
+            s = np.random.randn(bs, self.ppo.sd)
+            a = np.random.randint(0, self.ppo.ad, bs)
+            r = np.random.randn(bs); ns = np.random.randn(bs, self.ppo.sd)
+            self.ppo.update(s, a, r, ns, np.zeros(bs))
+    def _enc(self, x):
+        s = np.zeros(self.ppo.sd); n = min(len(x), self.ppo.sd - 4)
+        s[:n] = x[:n]/10.0; return s
+    def init_pop(self):
+        if not self.cfg.use_ppo_init:
+            return [np.random.uniform(0,1,self.n_var) for _ in range(self.pop_size)]
+        pop = []
+        n_ppo = max(1, int(self.pop_size*self.cfg.ppo_proportion))
+        n_h = max(1, int(self.pop_size*self.cfg.heuristic_proportion))
+        n_r = max(1, int(self.pop_size*self.cfg.random_proportion))
+        for _ in range(n_ppo):
+            seed = np.random.uniform(0,1,self.n_var)
+            a, _ = self.ppo.get_action(self._enc(seed), bf=0.3)
+            guided = seed.copy()
+            if self.n_var > 0:
+                guided[a % self.n_var] = np.clip(guided[a % self.n_var] + 0.3, 0, 1)
+            pop.append(guided)
+        for _ in range(n_h):
+            x = np.random.uniform(0,1,self.n_var)
+            no = max(1, self.problem.n_depots//2)
+            nd = self.problem.n_depots
+            if nd > 0:
+                caps = self.problem._depot_caps
+                top = np.argsort(caps)[::-1][:no]
+                x[:nd] = 0.0; x[top] = 1.0
+            pop.append(x)
+        for _ in range(n_r):
+            pop.append(np.random.uniform(0,1,self.n_var))
+        while len(pop) < self.pop_size:
+            pop.append(1.0 - np.random.uniform(0,1,self.n_var))
+        return pop[:self.pop_size]
+    def evaluate(self, x):
+        key = np.asarray(x, dtype=float).tobytes()
+        c = self._eval_cache.get(key)
+        if c is not None: return c
+        try:
+            val = self.problem.evaluate(x) if self.cfg.use_dro_bound \
+                  else self.problem.evaluate_deterministic(x)
+        except Exception: val = (1e10, 1e10, 1e10)
+        if len(self._eval_cache) >= 50000: self._eval_cache.clear()
+        self._eval_cache[key] = val
+        return val
+    def _crowd(self, front, fit=None):
+        n = len(front)
+        if n <= 2: return [float('inf')]*n
+        if fit is None: fit = [self.evaluate(s) for s in front]
+        d = [0.0]*n; m = len(fit[0])
+        for k in range(m):
+            order = sorted(range(n), key=lambda i: fit[i][k])
+            d[order[0]] = float('inf'); d[order[-1]] = float('inf')
+            lo, hi = fit[order[0]][k], fit[order[-1]][k]
+            rng = hi - lo if hi > lo else 1.0
+            for i in range(1, n-1):
+                d[order[i]] += (fit[order[i+1]][k] - fit[order[i-1]][k])/rng
+        return d
+    def _div(self, pop):
+        if not pop: return 0.0
+        return len(set(tuple(np.round(p,6)) for p in pop))/len(pop)
+    def _conv_state(self, pop):
+        if not pop: return 0.0
+        fit = [self.evaluate(p) for p in pop]; m = len(fit[0]); tot = 0.0
+        for k in range(m):
+            vals = [f[k] for f in fit if np.isfinite(f[k])]
+            if not vals: continue
+            lo, hi = min(vals), max(vals); rng = hi - lo if hi > lo else 1.0
+            tot += np.mean([(v-lo)/rng for v in vals])
+        return float(tot/m) if np.isfinite(tot) else 0.0
+    def _ops(self, gen):
+        if not self.cfg.use_adaptive_operators:
+            return (self.cfg.exploitation_base, self.cfg.exploration_base)
+        g, G = gen, max(1, self.max_gen)
+        conv = self._conv_state(self.population)
+        div = self._div(self.population)
+        fb = max(0.5, min(1.5, 1.0 + div - conv))
+        return (max(0.5, min(0.95, self.cfg.exploitation_base*(1-np.exp(-g/G))*fb)),
+                max(0.02, min(0.3, self.cfg.exploration_base*np.exp(-g/G)/fb)))
+    def _upd_arc(self):
+        mx = int(self.cfg.archive_size_ratio*self.pop_size)
+        fronts = non_dominated_sort(self.fitness)
+        if not fronts: return
+        for i in fronts[0]:
+            s = self.population[i]
+            if len(self.archive) < mx: self.archive.append(s)
+            else:
+                d = self._crowd(self.archive); k = int(np.argmin(d))
+                if d[k] < float('inf'): self.archive[k] = s
+    def _reset_arc(self, gen):
+        if not self.archive: return
+        if gen - self._last_reset < self.cfg.diversity_reset_min_interval: return
+        n = min(int(self.cfg.diversity_reset_proportion*self.pop_size), len(self.archive))
+        if n == 0: return
+        sums = [sum(f) for f in self.fitness]
+        worst = sorted(range(len(self.population)), key=lambda i: sums[i], reverse=True)
+        idxs = np.random.choice(len(self.archive), n, replace=False)
+        for i, a in enumerate(idxs):
+            if i < len(worst):
+                self.population[worst[i]] = self.archive[a].copy()
+                self.fitness[worst[i]] = self.evaluate(self.archive[a])
+        self._last_reset = gen
+    def _sbx(self, p1, p2, rate):
+        if np.random.random() > rate: return p1.copy()
+        c = p1.copy(); mask = np.random.random(len(p1)) < 0.5
+        c[mask] = p2[mask]; return c
+    def _mut(self, x, rate):
+        m = x.copy(); mask = np.random.random(len(x)) < rate
+        m[mask] += np.random.normal(0, 0.1, size=mask.sum())
+        return np.clip(m, 0, 1)
+    def _tourn(self, k):
+        sel = []
+        for _ in range(k):
+            i, j = np.random.choice(len(self.population), 2, replace=False)
+            f0, f1 = self.fitness[i], self.fitness[j]
+            if _dominates(f0, f1): sel.append(self.population[i])
+            elif _dominates(f1, f0): sel.append(self.population[j])
+            else: sel.append(self.population[i])
+        return sel
+    def _ls(self, x, n=None):
+        n = n or self.cfg.local_search_iterations
+        eps = float(getattr(self.cfg, 'local_search_epsilon', 0.0))
+        best = x.copy(); bf = self.evaluate(best)
+        for it in range(n):
+            c = best.copy()
+            if it < n//2:
+                i, j = np.random.choice(len(c), 2, replace=False)
+                c[i], c[j] = c[j], c[i]
+            else:
+                nd = self.problem.n_depots
+                if self.n_var >= 2:
+                    i, j = sorted(np.random.choice(self.n_var, 2, replace=False))
+                    seg = c[nd+i: nd+j+1].copy()
+                    c[nd+i: nd+j+1] = seg[::-1]
+            cf = self.evaluate(c)
+            if eps > 0.0:
+                if _epsilon_dominates(cf, bf, eps): best, bf = c, cf
+            else:
+                if _dominates(cf, bf): best, bf = c, cf
+        return best
+    def run(self):
+        self.population = self.init_pop()
+        self.fitness = [self.evaluate(p) for p in self.population]
+        fronts = non_dominated_sort(self.fitness)
+        if fronts:
+            self.archive = [self.population[i]
+                            for i in fronts[0][:int(self.cfg.archive_size_ratio*self.pop_size)]]
+        for gen in range(self.max_gen):
+            div = self._div(self.population)
+            p_c, p_m = self._ops(gen)
+            off = []
+            while len(off) < self.pop_size:
+                p1, p2 = self._tourn(2)
+                c = self._sbx(p1, p2, p_c); c = self._mut(c, p_m); off.append(c)
+            off_fit = [self.evaluate(c) for c in off]
+            comb = self.population + off; comb_fit = self.fitness + off_fit
+            fronts = non_dominated_sort(comb_fit)
+            np_, nf = [], []
+            for fr in fronts:
+                if len(np_) + len(fr) <= self.pop_size:
+                    for i in fr: np_.append(comb[i]); nf.append(comb_fit[i])
+                else:
+                    d = crowding_distance(comb_fit, fr)
+                    order = np.argsort(-d)
+                    rem = self.pop_size - len(np_)
+                    for i in order[:rem]:
+                        np_.append(comb[fr[i]]); nf.append(comb_fit[fr[i]])
+                    break
+            self.population, self.fitness = np_, nf
+            self._upd_arc()
+            if div < self.cfg.diversity_reset_threshold:
+                self._reset_arc(gen)
+            if (self.cfg.use_local_search
+                    and gen % self.cfg.local_search_frequency == 0):
+                nt = max(1, int(self.pop_size*self.cfg.local_search_top_proportion))
+                top = sorted(range(len(self.population)),
+                             key=lambda i: sum(self.fitness[i]))[:nt]
+                for i in top:
+                    im = self._ls(self.population[i])
+                    self.population[i] = im; self.fitness[i] = self.evaluate(im)
+        fronts = non_dominated_sort(self.fitness)
+        idx = fronts[0] if fronts else []
+        pareto = [self.population[i] for i in idx]
+        pareto_fit = [self.fitness[i] for i in idx]
+        return {'population': pareto, 'fitness': pareto_fit}
+
+
+# ============================================================================
+# METRICS
+# ============================================================================
+def _compute_hv(fit, ref=None, lo=None, n_samples=3000):
+    try:
+        F = np.asarray(fit, dtype=float)
+        F = F[np.all(np.isfinite(F) & (np.abs(F) < 1e12), axis=1)]
+        if len(F) == 0: return 0.0
+        m = F.shape[1]
+        if ref is None or lo is None:
+            ref = np.where(F.max(0)*1.1 > 1e-9, F.max(0)*1.1, 1.0)
+            lo = F.min(0)
+        ref = np.asarray(ref, dtype=float).flatten()[:m]
+        lo = np.asarray(lo, dtype=float).flatten()[:m]
+        span = ref - lo; span[span < 1e-12] = 1.0
+        Fn = (F - lo)/span
+        le = (Fn[None, :, :] >= Fn[:, None, :]).all(axis=-1)
+        sl = (Fn[None, :, :] > Fn[:, None, :]).any(axis=-1)
+        dom = le & sl
+        np.fill_diagonal(dom, False)
+        nd = Fn[~dom.any(axis=1)]
+        if len(nd) == 0: return 0.0
+        rng = np.random.default_rng(0)
+        pts = rng.uniform(0, 1, (n_samples, m))
+        inside = (pts[:, None, :] >= nd[None, :, :]).all(axis=2).any(axis=1)
+        return float(inside.mean())
+    except Exception:
+        return 0.0
+
+def compute_metrics_3obj(pareto_fit, ref=None, lo=None):
+    if pareto_fit is None or len(pareto_fit) == 0:
+        return {'hypervolume': 0.0, 'best_cost': float('inf'),
+                'best_emission': float('inf'), 'best_time': float('inf')}
+    F = np.asarray(pareto_fit, dtype=float)
+    F = F[np.all(np.isfinite(F) & (np.abs(F) < 1e12), axis=1)]
+    if len(F) == 0:
+        return {'hypervolume': 0.0, 'best_cost': float('inf'),
+                'best_emission': float('inf'), 'best_time': float('inf')}
+    hv = _compute_hv(F, ref=ref, lo=lo, n_samples=10000)
+    return {'hypervolume': float(hv),
+            'best_cost': float(F[:,0].min()),
+            'best_emission': float(F[:,1].min()),
+            'best_time': float(F[:,2].min())}
+
+def cliffs_delta(a, b):
+    a = np.asarray([x for x in a if np.isfinite(x)], dtype=float)
+    b = np.asarray([x for x in b if np.isfinite(x)], dtype=float)
+    if len(a) == 0 or len(b) == 0: return 0.0
+    gt = (a[:, None] > b[None, :]).sum()
+    lt = (a[:, None] < b[None, :]).sum()
+    return float((gt - lt)/(len(a)*len(b)))
+
+
+# ============================================================================
+# DETERMINISTIC DECODE + ROBUST REFERENCE BOX
+# ============================================================================
+def _decode_front_to_deterministic(problem, pop):
+    if pop is None or len(pop) == 0:
+        return np.empty((0, 3), dtype=float)
+    rows = []
+    for s in pop:
+        try:
+            c, e, t = problem.evaluate_deterministic(s)
+            if np.isfinite(c) and np.isfinite(e) and np.isfinite(t):
+                rows.append((float(c), float(e), float(t)))
+        except Exception:
+            continue
+    return np.asarray(rows, dtype=float) if rows else np.empty((0, 3))
+
+def _robust_reference_box(arrays, upper_q=0.95, lower_q=0.05, pad=1.05):
+    ne = [a for a in arrays if a is not None and len(a) > 0
+          and np.all(np.isfinite(a) & (np.abs(a) < 1e12))]
+    if not ne: return None, None
+    P = np.vstack(ne)
+    if len(P) == 0: return None, None
+    q_hi = np.quantile(P, upper_q, axis=0)
+    q_lo = np.quantile(P, lower_q, axis=0)
+    ref = np.where(q_hi * pad > 1e-9, q_hi * pad, 1.0)
+    lo = q_lo
+    span = ref - lo
+    bad = span < 1e-12
+    if np.any(bad): ref[bad] = lo[bad] + 1.0
+    return ref, lo
+
+
+# ============================================================================
+# SIZE CLASSES + VARIANT DEFINITIONS
+# ============================================================================
+ABLATION_VARIANTS = [
+    ('full',            {}),
+    ('no-DRO',          {'use_dro_bound': False}),
+    ('no-PPO',          {'use_ppo_init': False}),
+    ('no-adaptive',     {'use_adaptive_operators': False}),
+    ('no-local-search', {'use_local_search': False}),
+]
+
+def _size_class(inst_name):
+    """
+    Return the size class of an instance:
+      - 'G-n' for green instances with n customers
+      - 'n' for non-green instances with n customers
+    where n is the customer count parsed from the name.
+    Examples:
+      '20-5-1a'     -> '20'
+      '50-5-2ab'    -> '50'
+      '100-10-1ab'  -> '100'
+      '200-10-3ab'  -> '200'
+      'G20-5-1a'    -> 'G20'
+      'G200-10-1ab' -> 'G200'
+    """
+    s = str(inst_name)
+    prefix = 'G' if s.startswith('G') else ''
+    body = s[1:] if prefix else s
+    for tok in body.replace('-', '_').split('_'):
+        if tok.isdigit():
+            return f"{prefix}{int(tok)}"
+    return f"{prefix}unknown"
+
+
+# ============================================================================
+# ABLATION RUNNER
+# ============================================================================
+class AblationRunner:
+    def __init__(self, base_cfg, base_seed=42):
+        self.base_cfg = base_cfg
+        self.base_seed = base_seed
+        self.rows = []
+        self.per_run = []
+        self.eval_rows = []
+        np.random.seed(base_seed); random.seed(base_seed)
+
+    def _get_seed(self, run): return self.base_seed + run
+
+    # ------------------------------------------------------------------
+    # PART B — ablation with deterministic decode
+    # ------------------------------------------------------------------
+    def run_ablation(self, instances, num_runs=10):
+        log("\n" + "=" * 70)
+        log("PART B — COMPONENT ABLATION (deterministic-decode scoring)")
+        log("=" * 70)
+        variants = [(n, replace(self.base_cfg, **ov))
+                    for n, ov in ABLATION_VARIANTS]
+        self.rows = []; self.per_run = []
+
+        for inst in instances:
+            log(f"\n  Instance: {inst.name}  "
+                f"(size-class {_size_class(inst.name)})")
+            problem = LCCLRP(inst, evaluation_mode='dro')
+            raw_det = {}
+            for vname, vcfg in variants:
+                t0 = time.time()
+                det_fronts = []
+                for run in range(num_runs):
+                    seed = self._get_seed(run)
+                    np.random.seed(seed); random.seed(seed)
+                    try:
+                        algo = DROEMO(problem, vcfg)
+                        result = algo.run()
+                        pop = result.get('population', [])
+                    except Exception as e:
+                        log(f"    [warn] {vname} run={run} failed: {e}")
+                        pop = []
+                    det = _decode_front_to_deterministic(problem, pop)
+                    det_fronts.append(det)
+                raw_det[vname] = det_fronts
+                n_ok = sum(1 for d in det_fronts if len(d) > 0)
+                log(f"    {vname:<18} {n_ok}/{num_runs} non-empty "
+                    f"({time.time()-t0:.1f}s)")
+
+            pooled = [d for fl in raw_det.values() for d in fl]
+            ref, lo = _robust_reference_box(pooled)
+
+            for vname, _ in variants:
+                hvs, bcs, bco2s, bts = [], [], [], []
+                for run_idx, det in enumerate(raw_det[vname]):
+                    m = compute_metrics_3obj(det, ref=ref, lo=lo)
+                    hvs.append(m['hypervolume']); bcs.append(m['best_cost'])
+                    bco2s.append(m['best_emission']); bts.append(m['best_time'])
+                    self.per_run.append({
+                        'Instance': inst.name,
+                        'SizeClass': _size_class(inst.name),
+                        'Variant': vname,
+                        'Run': run_idx,
+                        'Hypervolume': float(m['hypervolume']),
+                        'Best_Cost': float(m['best_cost']),
+                        'Best_CO2': float(m['best_emission']),
+                        'Best_Time': float(m['best_time']),
+                    })
+                if not hvs:
+                    hvs = [0.0]; bcs=[np.nan]; bco2s=[np.nan]; bts=[np.nan]
+                log(f"    {vname:<18} HV_det={np.mean(hvs):.4f} "
+                    f"±{np.std(hvs):.4f}  cost={np.nanmean(bcs):.6g}  "
+                    f"CO2={np.nanmean(bco2s):.6g}")
+                self.rows.append({
+                    'Instance': inst.name,
+                    'SizeClass': _size_class(inst.name),
+                    'Variant': vname,
+                    'Hypervolume_mean': float(np.mean(hvs)),
+                    'Hypervolume_std': float(np.std(hvs)),
+                    'Best_Cost_mean': float(np.nanmean(bcs)),
+                    'Best_CO2_mean': float(np.nanmean(bco2s)),
+                    'Best_Time_mean': float(np.nanmean(bts)),
+                    'N_Runs': num_runs,
+                })
+
+        self._write_ablation_outputs()
+        return pd.DataFrame(self.rows)
+
+    def _write_ablation_outputs(self):
+        if not self.rows: return
+        df = pd.DataFrame(self.rows)
+        df.to_csv(os.path.join(ABLATION_DIR, 'ablation_results.csv'), index=False)
+        if self.per_run:
+            pd.DataFrame(self.per_run).to_csv(
+                os.path.join(ABLATION_DIR, 'ablation_per_run.csv'), index=False)
+        log(f"\n  [ok] Saved ablation_results.csv and ablation_per_run.csv")
+
+    def write_size_class_summary(self):
+        """
+        Group the ablation results by size class and report, per size
+        class, the mean HV of each variant and its loss relative to full.
+        """
+        if not self.rows:
+            return
+        df = pd.DataFrame(self.rows)
+        log("\n" + "=" * 78)
+        log("ABLATION SUMMARY BY SIZE CLASS (mean HV on deterministic decode)")
+        log("=" * 78)
+        # Sort size classes numerically when possible.
+        def _size_key(sc):
+            s = str(sc).lstrip('G')
+            try: return (0 if not str(sc).startswith('G') else 1, int(s))
+            except ValueError: return (2, 0)
+        size_classes = sorted(df['SizeClass'].unique(), key=_size_key)
+
+        lines = []
+        header = f"{'SizeClass':<10} " + "".join(
+            f"{v:<18}" for v, _ in ABLATION_VARIANTS) + "  | N_inst"
+        lines.append(header)
+        lines.append("-" * len(header))
+        for sc in size_classes:
+            sub = df[df['SizeClass'] == sc]
+            n_inst = sub['Instance'].nunique()
+            row_vals = {}
+            for vname, _ in ABLATION_VARIANTS:
+                vsub = sub[sub['Variant'] == vname]
+                row_vals[vname] = vsub['Hypervolume_mean'].mean() \
+                    if len(vsub) else float('nan')
+            full_hv = row_vals.get('full', float('nan'))
+            cells = []
+            for vname, _ in ABLATION_VARIANTS:
+                hv = row_vals[vname]
+                if vname == 'full' or not np.isfinite(full_hv) or full_hv == 0:
+                    cells.append(f"{hv:.4f}         ")
+                else:
+                    pct = 100.0 * (full_hv - hv) / full_hv
+                    cells.append(f"{hv:.4f}({pct:+.1f}%)")
+            lines.append(f"{sc:<10} " + "".join(f"{c:<18}" for c in cells)
+                         + f"  | {n_inst}")
+        lines.append("")
+        lines.append("Format: HV (loss vs full).  Positive loss = variant is worse.")
+        lines.append("")
+        txt = "\n".join(lines)
+        log(txt)
+        with open(os.path.join(ABLATION_DIR, 'ablation_by_size_class.txt'), 'w') as f:
+            f.write(txt)
+
+    # ------------------------------------------------------------------
+    # PART B — paired Wilcoxon, stratified by size class
+    # ------------------------------------------------------------------
+    def statistical_analysis_ablation_by_size_class(
+            self, reference='full', alpha=0.05, bonferroni=4):
+        """
+        Paired Wilcoxon on per-run HV, grouped by size class.
+        Within each size class, we pool the per-run paired differences
+        across all instances of that class (matched by run index).
+        """
+        if not self.per_run:
+            log("  [warn] no per-run rows; skipping ablation stats")
+            return None
+        df = pd.DataFrame(self.per_run)
+        ab = alpha / bonferroni
+
+        def _size_key(sc):
+            s = str(sc).lstrip('G')
+            try: return (0 if not str(sc).startswith('G') else 1, int(s))
+            except ValueError: return (2, 0)
+        size_classes = sorted(df['SizeClass'].unique(), key=_size_key)
+
+        rows = []
+        lines = ["=" * 130,
+                 "PART B — PAIRED WILCOXON ON ABLATION HV, BY SIZE CLASS",
+                 f"Reference: {reference}   alpha={alpha}   Bonf={ab:.4f}",
+                 "Pooling per-run paired differences across all instances",
+                 "of the same size class, matched by run index.",
+                 "=" * 130,
+                 f"{'SizeClass':<10} {'Comparison':<24} {'N':<4} "
+                 f"{'Median_diff':<14} {'Mean_diff':<14} "
+                 f"{'p':<12} {'Sig':<6} {'Cliff d':<10}",
+                 "-" * 130]
+
+        for sc in size_classes:
+            sub = df[df['SizeClass'] == sc]
+            for vname, _ in ABLATION_VARIANTS:
+                if vname == reference: continue
+                diffs_pooled = []
+                for inst in sub['Instance'].unique():
+                    ist = sub[sub['Instance'] == inst]
+                    ref = ist[ist['Variant'] == reference].set_index('Run')
+                    var = ist[ist['Variant'] == vname].set_index('Run')
+                    common = ref.index.intersection(var.index)
+                    if len(common) < 1: continue
+                    d = (ref.loc[common, 'Hypervolume'].values
+                         - var.loc[common, 'Hypervolume'].values)
+                    diffs_pooled.extend(d.tolist())
+                diffs_pooled = np.asarray(diffs_pooled, dtype=float)
+                diffs_pooled = diffs_pooled[np.isfinite(diffs_pooled)]
+                if len(diffs_pooled) < 5: continue
+                if np.all(diffs_pooled == 0):
+                    stat, p = float('nan'), 1.0; cd = 0.0
+                else:
+                    try:
+                        stat, p = stats.wilcoxon(diffs_pooled,
+                                                 alternative='two-sided')
+                    except Exception:
+                        stat, p = float('nan'), float('nan')
+                    a = diffs_pooled[diffs_pooled > 0]
+                    b = -diffs_pooled[diffs_pooled < 0]
+                    cd = cliffs_delta(a, b) if len(a) and len(b) else 0.0
+                sig = bool(np.isfinite(p) and p < ab)
+                rows.append({
+                    'SizeClass': sc,
+                    'Comparison': f"{reference} vs {vname}",
+                    'N': len(diffs_pooled),
+                    'Median_diff': float(np.median(diffs_pooled)),
+                    'Mean_diff': float(np.mean(diffs_pooled)),
+                    'Wilcoxon_stat': stat,
+                    'p_value': p,
+                    'Significant_at_Bonferroni': sig,
+                    'Cliffs_delta': cd,
+                })
+                lines.append(
+                    f"{sc:<10} {rows[-1]['Comparison']:<24} "
+                    f"{len(diffs_pooled):<4} "
+                    f"{rows[-1]['Median_diff']:<14.4g} "
+                    f"{rows[-1]['Mean_diff']:<14.4g} "
+                    f"{p:<12.4g} {str(sig):<6} {cd:<10.3f}")
+            lines.append("-" * 130)
+
+        txt = "\n".join(lines)
+        log(txt)
+        with open(os.path.join(ABLATION_DIR,
+                               'ablation_paired_wilcoxon_by_size_class.txt'),
+                  'w') as f:
+            f.write(txt)
+        if rows:
+            pd.DataFrame(rows).to_csv(
+                os.path.join(ABLATION_DIR,
+                             'ablation_paired_wilcoxon_by_size_class.csv'),
+                index=False)
+        return pd.DataFrame(rows)
+
+    # ------------------------------------------------------------------
+    # PART C — evaluation-mode comparison with duplicate collapsing
+    # ------------------------------------------------------------------
+    def run_evaluation_mode_comparison(self, instances, num_runs=10,
+                                       modes=('deterministic','stochastic','dro')):
+        log("\n" + "=" * 70)
+        log("PART C — EVALUATION-MODE COMPARISON (det decode)")
+        log("=" * 70)
+        self.eval_rows = []
+        for inst in instances:
+            log(f"\n  Instance: {inst.name}  "
+                f"(size-class {_size_class(inst.name)})")
+            raw_det = {}
+            for mode in modes:
+                t0 = time.time()
+                problem = LCCLRP(inst, evaluation_mode=mode)
+                det_fronts = []
+                for run in range(num_runs):
+                    seed = self._get_seed(run)
+                    np.random.seed(seed); random.seed(seed)
+                    try:
+                        algo = DROEMO(problem, self.base_cfg)
+                        result = algo.run()
+                        pop = result.get('population', [])
+                    except Exception as e:
+                        log(f"    [warn] mode={mode} run={run} failed: {e}")
+                        pop = []
+                    det = _decode_front_to_deterministic(problem, pop)
+                    det_fronts.append(det)
+                raw_det[mode] = det_fronts
+                n_ok = sum(1 for d in det_fronts if len(d) > 0)
+                log(f"    {mode:<14} {n_ok}/{num_runs} non-empty "
+                    f"({time.time()-t0:.1f}s)")
+            pooled = [d for fl in raw_det.values() for d in fl]
+            ref, lo = _robust_reference_box(pooled)
+
+            # Compute per-mode statistics.
+            per_mode = {}
+            for mode in modes:
+                hvs, bcs, bco2s, bts = [], [], [], []
+                for det in raw_det[mode]:
+                    m = compute_metrics_3obj(det, ref=ref, lo=lo)
+                    hvs.append(m['hypervolume']); bcs.append(m['best_cost'])
+                    bco2s.append(m['best_emission']); bts.append(m['best_time'])
+                if not hvs:
+                    hvs=[0.0]; bcs=[np.nan]; bco2s=[np.nan]; bts=[np.nan]
+                per_mode[mode] = {
+                    'HV_mean': float(np.mean(hvs)),
+                    'HV_std':  float(np.std(hvs)),
+                    'cost':    float(np.nanmean(bcs)),
+                    'co2':     float(np.nanmean(bco2s)),
+                    'time':    float(np.nanmean(bts)),
+                }
+
+            # Collapse modes whose (HV, cost, CO2, time) match to 6 decimals.
+            groups = []
+            used = set()
+            for m in modes:
+                if m in used: continue
+                g = [m]; used.add(m)
+                key = per_mode[m]
+                for m2 in modes:
+                    if m2 in used: continue
+                    k2 = per_mode[m2]
+                    if (abs(key['HV_mean'] - k2['HV_mean']) < 1e-6
+                            and abs(key['cost'] - k2['cost']) < 1e-6
+                            and abs(key['co2'] - k2['co2']) < 1e-6
+                            and abs(key['time'] - k2['time']) < 1e-6):
+                        g.append(m2); used.add(m2)
+                groups.append(g)
+
+            for grp in groups:
+                head = per_mode[grp[0]]
+                label = "+".join(grp)
+                log(f"    {label:<32} HV_det={head['HV_mean']:.4f} "
+                    f"±{head['HV_std']:.4f}  cost={head['cost']:.6g}  "
+                    f"CO2={head['co2']:.6g}")
+                self.eval_rows.append({
+                    'Instance': inst.name,
+                    'SizeClass': _size_class(inst.name),
+                    'Evaluation_Modes_Grouped': label,
+                    'N_Modes_In_Group': len(grp),
+                    'Hypervolume_mean': head['HV_mean'],
+                    'Hypervolume_std':  head['HV_std'],
+                    'Best_Cost_mean': head['cost'],
+                    'Best_CO2_mean':  head['co2'],
+                    'Best_Time_mean': head['time'],
+                    'N_Runs': num_runs,
+                })
+
+        if self.eval_rows:
+            pd.DataFrame(self.eval_rows).to_csv(
+                os.path.join(ABLATION_DIR, 'evaluation_mode_comparison.csv'),
+                index=False)
+            log(f"\n  [ok] Saved evaluation_mode_comparison.csv "
+                f"({len(self.eval_rows)} rows, duplicates collapsed)")
+        return pd.DataFrame(self.eval_rows)
+
+
+# ============================================================================
+# RUN
+# ============================================================================
+log("Loading instances...")
+instances = load_prins_instances(INPUT_EXCEL)
+log(f"Loaded {len(instances)} instances.")
+
+# Choose which instances to ablate.  Three options are given; pick one.
+# --------------------------------------------------------------------------
+SELECTION = "all"          # one of: "small", "scaling", "all"
+# --------------------------------------------------------------------------
+
+if SELECTION == "small":
+    # The three 20-customer non-green instances only (baseline).
+    ABLATION_NAMES = ['20-5-1a', '20-5-2a', '20-5-2b']
+elif SELECTION == "scaling":
+    # One per size class plus the two green 20-customer instances.
+    ABLATION_NAMES = [
+        '20-5-1a', '20-5-2a', '20-5-2b',
+        '50-5-2ab', '50-5-2BIS', '50-5-3ab',
+        '100-10-1ab', '100-10-2ab', '100-10-3ab',
+        '200-10-1ab', '200-10-2ab', '200-10-3ab',
+        'G20-5-1a', 'G20-5-1b',
+    ]
+elif SELECTION == "all":
+    ABLATION_NAMES = [i.name for i in instances]
+else:
+    raise ValueError(f"Unknown SELECTION={SELECTION!r}")
+
+ablation_instances = [i for i in instances if i.name in ABLATION_NAMES]
+N_RUNS = 10
+log(f"[ablation] SELECTION={SELECTION}, "
+    f"{len(ablation_instances)} instances selected, "
+    f"{N_RUNS} runs per variant")
+log(f"[ablation] output directory: {ABLATION_DIR}")
+
+base_cfg = DROEMOConfig()
+runner = AblationRunner(base_cfg, base_seed=42)
+
+# Part B
+runner.run_ablation(ablation_instances, num_runs=N_RUNS)
+
+# Summary by size class (write after the raw ablation is done).
+runner.write_size_class_summary()
+
+# Paired Wilcoxon, stratified by size class.
+runner.statistical_analysis_ablation_by_size_class(
+    reference='full', alpha=0.05, bonferroni=4)
+
+# Part C
+runner.run_evaluation_mode_comparison(
+    ablation_instances, num_runs=N_RUNS,
+    modes=('deterministic', 'stochastic', 'dro'))
+
+log("DONE.")
+log(f"Output: {ABLATION_DIR}")
