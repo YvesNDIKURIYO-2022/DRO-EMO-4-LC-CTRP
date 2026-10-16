@@ -1,925 +1,1789 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+r"""
+DRO-EMO: Prins Routing Benchmark (main experiment)
+==================================================
+
+PART A only.  Benchmarks DRO-EMO against NSGA-II, NSGA-III, SPEA2,
+MOEA/D, RL-NSGAII on the Prins LRP instances.  Hypervolume is
+normalized to [0, 1] against a per-instance pooled reference box.
+
+Statistics: Kruskal-Wallis on HV, Mann-Whitney U (DRO-EMO vs each),
+Cliff's delta and Cohen's d, paired Wilcoxon on deterministic cost
+and CO2 matched by run index.
+
+The ablation is in a separate script: benchmark_ablation.py
+
+COMMAND LINE
+------------
+  --smoke               3 instances x 5 runs x 6 algorithms
+  --runs N              number of runs per algorithm (default 30)
 """
-PPO-ADAPTIVE INITIALIZATION COMPARISON ON PRINS INSTANCES (COST GREEDY REMOVED)
-Tests ONLY the initialization quality (NO evolution, NO optimization)
 
-Compares:
-1. PPO-Adaptive Initialization - size-adaptive, ensemble, 4 strategies
-2. Classic PPO Initialization - fixed parameters, single strategy  
-3. Random Initialization - baseline
-4. Latin Hypercube - stratified sampling
+# ============================================================================
+# ENVIRONMENT SANITY CHECK
+# ============================================================================
+import sys
+import importlib.util
 
-COST GREEDY REMOVED - Validation showed it uses different evaluation logic
-"""
+_required = ["numpy", "scipy", "matplotlib", "openpyxl", "pandas"]
+_missing = [pkg for pkg in _required if importlib.util.find_spec(pkg) is None]
+if _missing:
+    print("=" * 70)
+    print("MISSING REQUIRED PACKAGES")
+    print("=" * 70)
+    print(f"  pip install {' '.join(_missing)}")
+    sys.exit(1)
 
+import subprocess, json
+
+_probe_code = (
+    "import json, sys;"
+    "import numpy as np;"
+    "out = {"
+    "  'version': np.__version__,"
+    "  'file': np.__file__,"
+    "  'has_subtract': hasattr(np, 'subtract'),"
+    "  'has_add': hasattr(np, 'add'),"
+    "  'has_linspace': hasattr(np, 'linspace'),"
+    "};"
+    "print(json.dumps(out))"
+)
+try:
+    _probe = subprocess.run([sys.executable, "-c", _probe_code],
+                            capture_output=True, text=True, timeout=60)
+except Exception as _e:
+    print("=" * 70); print("FAILED TO PROBE NUMPY"); print("=" * 70)
+    print(f"  {_e}"); sys.exit(1)
+if _probe.returncode != 0:
+    print("=" * 70); print("NUMPY PROBE FAILED"); print("=" * 70); sys.exit(1)
+try:
+    _probe_info = json.loads(_probe.stdout.strip().splitlines()[-1])
+except Exception:
+    _probe_info = {"version": "unknown", "has_subtract": False,
+                   "has_add": False, "has_linspace": False}
+if not (_probe_info.get("has_subtract") and _probe_info.get("has_add")
+        and _probe_info.get("has_linspace")):
+    print("=" * 70); print("BROKEN NUMPY INSTALLATION"); print("=" * 70)
+    sys.exit(1)
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import time
 import random
-import os
-from pathlib import Path
-from typing import Dict, List, Tuple
-from collections import defaultdict
-from scipy.spatial.distance import cdist
+import matplotlib
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Dict, Any
+from dataclasses import dataclass, field
+import time, os, argparse
+from datetime import datetime
+from scipy import stats
+from scipy.spatial import distance
+from itertools import combinations_with_replacement
 import warnings
 warnings.filterwarnings('ignore')
 
-# Set style for publication-quality plots
-try:
-    plt.style.use('seaborn-v0_8-darkgrid')
-except:
+
+def _get_cmap(name):
     try:
-        plt.style.use('seaborn-darkgrid')
-    except:
+        return matplotlib.colormaps[name]
+    except (AttributeError, KeyError):
+        return plt.cm.get_cmap(name)
+
+
+def _tab_colors(n):
+    if n <= 0:
+        return np.zeros((0, 4))
+    return _get_cmap('tab10')(np.linspace(0, 1, max(n, 1)))
+
+
+def log(msg: str):
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
+
+
+# ============================================================================
+# PATHS
+# ============================================================================
+INPUT_EXCEL = (
+    r"D:\Container Transportation Routing Problems\Manuscript3-A Low-carbon "
+    r"based Robust Optimization under uncertainty"
+    r"\Dataset - Prins LRP original instances and adapted instances.xlsx"
+)
+OUTPUT_BASE_DIR = (
+    r"D:\Container Transportation Routing Problems\Manuscript3-A Low-carbon "
+    r"based Robust Optimization under uncertainty"
+    r"\DRO-EMO on Prins Routing Benchmarks\benchmark"
+)
+
+print(f"[env] numpy={np.__version__}, matplotlib={matplotlib.__version__}, "
+      f"pandas={pd.__version__}", flush=True)
+
+
+# ============================================================================
+# MODEL PARAMETERS
+# ============================================================================
+@dataclass
+class RoutingModelParams:
+    vehicle_capacity: float = 70.0
+    vehicle_fixed_cost: float = 1000.0
+    carbon_treatment_cost: float = 0.354
+    emission_coefficient: float = 2.63
+    diesel_unit_cost: float = 7.51
+    diesel_cons_empty: float = 0.12385
+    diesel_cons_full: float = 0.13641
+    electricity_unit_cost: float = 0.72
+    elec_cons_empty: float = 0.32456
+    elec_cons_full: float = 0.421928
+    ev_battery_max: float = 41.0
+    avg_speed_kmh: float = 40.0
+    service_time_h: float = 0.1
+    fixed_depot_emission: float = 0.0
+
+
+# ============================================================================
+# INSTANCE PARSER
+# ============================================================================
+class PrinsInstance:
+    def __init__(self, sheet_name, df):
+        self.name = sheet_name
+        self.raw = df
+        self.is_green = sheet_name.startswith("G")
+        self.depots: Dict[str, Dict[str, float]] = {}
+        self.customers: Dict[str, Dict[str, float]] = {}
+        self.vehicle_capacity = 70.0
+        self.vehicle_fixed_cost = 1000.0
+        self.params = RoutingModelParams()
+        self._parse(df)
+
+    def _parse(self, df):
+        rows = df.values.tolist()
+        data_rows = rows[1:] if len(rows) > 1 else rows
+        for row in data_rows:
+            if len(row) < 4: continue
+            label = row[0]
+            if label is None: continue
+            label_s = str(label).strip()
+            if not label_s.lower().startswith("d"): continue
+            try:
+                x = float(row[1]); y = float(row[2])
+                cap = float(row[3]) if row[3] not in (None, "", " ") else 0.0
+            except (ValueError, TypeError):
+                continue
+            try:
+                oc = float(row[4]) if len(row) > 4 and row[4] not in (None, "", " ") else 0.0
+            except (ValueError, TypeError):
+                oc = 0.0
+            fe = 0.0
+            if self.is_green and len(row) > 5 and row[5] not in (None, "", " "):
+                try:
+                    v = row[5]
+                    fe = oc / 10.0 if isinstance(v, str) and v.startswith("=") else float(v)
+                except (ValueError, TypeError):
+                    fe = oc / 10.0
+            if label_s not in self.depots:
+                self.depots[label_s] = {"x": x, "y": y, "capacity": cap,
+                                        "opening_cost": oc, "fixed_emission": fe}
+
+        prev_id = 0
+        for row in data_rows:
+            if len(row) < 4: continue
+            label = row[0]
+            if label is None: continue
+            label_s = str(label).strip()
+            if label_s.lower().startswith("d"): continue
+            try:
+                cid = int(float(label_s))
+            except (ValueError, TypeError):
+                continue
+            if cid <= prev_id: continue
+            try:
+                x = float(row[1]); y = float(row[2])
+                dem = float(row[3]) if row[3] not in (None, "", " ") else 0.0
+            except (ValueError, TypeError):
+                continue
+            self.customers[str(cid)] = {"x": x, "y": y, "demand": dem}
+            prev_id = cid
+
+        for row in data_rows:
+            for j, cell in enumerate(row):
+                if cell is None: continue
+                s = str(cell).strip().lower()
+                if s == "vehicle capacity":
+                    for k in range(j + 1, len(row)):
+                        if row[k] not in (None, "", " "):
+                            try:
+                                self.vehicle_capacity = float(str(row[k]).split("/")[0])
+                            except (ValueError, TypeError):
+                                pass
+                            break
+                if s == "opening cost of a route (cost of a vehicle)":
+                    for k in range(j + 1, len(row)):
+                        if row[k] not in (None, "", " "):
+                            try:
+                                self.vehicle_fixed_cost = float(row[k])
+                            except (ValueError, TypeError):
+                                pass
+                            break
+
+    @property
+    def n_depots(self): return len(self.depots)
+    @property
+    def n_customers(self): return len(self.customers)
+    @property
+    def n_var(self): return self.n_customers
+    @property
+    def n_obj(self): return 3
+
+    def __repr__(self):
+        return (f"PrinsInstance({self.name}, depots={self.n_depots}, "
+                f"customers={self.n_customers}, cap={self.vehicle_capacity})")
+
+
+def load_prins_instances(excel_path, instance_filter=None):
+    if not os.path.isfile(excel_path):
+        raise FileNotFoundError(excel_path)
+    xls = pd.ExcelFile(excel_path)
+    out = []
+    for sheet in xls.sheet_names:
+        if instance_filter is not None and sheet not in instance_filter:
+            continue
         try:
-            plt.style.use('ggplot')
-        except:
-            pass
-
-plt.rcParams['font.size'] = 11
-plt.rcParams['figure.dpi'] = 150
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-EXCEL_PATH = MANUSCRIPT_DIR / "Dataset - Prins LRP original instances and adapted instances.xlsx"
-
-OUTPUT_DIR = MANUSCRIPT_DIR / "Initialization_Comparison_Results"
-OUTPUT_DIR.mkdir(exist_ok=True)
-PLOTS_DIR = OUTPUT_DIR / "plots"
-PLOTS_DIR.mkdir(exist_ok=True)
-
-print(f"\n📁 Results will be saved to: {OUTPUT_DIR}")
-print(f"📁 Plots will be saved to: {PLOTS_DIR}")
-
-# Color scheme for methods (Cost Greedy removed)
-METHOD_COLORS = {
-    'PPO-Adaptive': '#2ecc71',      # Green - Proposed
-    'Classic PPO': '#3498db',        # Blue
-    'Random': '#95a5a6',             # Gray
-    'Latin Hypercube': '#9b59b6'     # Purple
-}
-
-METHOD_MARKERS = {
-    'PPO-Adaptive': 'o',
-    'Classic PPO': 's',
-    'Random': '^',
-    'Latin Hypercube': '<'
-}
-
-
-# ============================================================================
-# PRINS EXCEL LOADER
-# ============================================================================
-
-class PrinsExcelLoader:
-    def __init__(self, excel_path: str):
-        self.excel_path = Path(excel_path)
-    
-    def get_all_sheets(self) -> List[str]:
-        try:
-            xl = pd.ExcelFile(self.excel_path)
-            return xl.sheet_names
+            df = pd.read_excel(excel_path, sheet_name=sheet, header=None)
+            inst = PrinsInstance(sheet, df)
+            if inst.n_depots == 0 or inst.n_customers == 0:
+                log(f"  [skip] {sheet}: no depots or customers parsed")
+                continue
+            out.append(inst)
         except Exception as e:
-            print(f"Error reading Excel file: {e}")
-            return []
-    
-    def load_instance(self, sheet_name: str) -> Dict:
-        df = pd.read_excel(self.excel_path, sheet_name=sheet_name, header=None)
-        
-        instance_data = {
-            'name': sheet_name,
-            'is_green': sheet_name.startswith('G'),
-            'depots': [],
-            'customers': [],
-            'vehicle_capacity': 150,
-            'route_fixed_cost': 1000,
-        }
-        
-        for idx, row in df.iterrows():
-            if len(row) < 4:
-                continue
-            first_cell = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ""
-            
-            if first_cell.startswith('d'):
-                try:
-                    depot = {
-                        'id': first_cell,
-                        'x': float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0,
-                        'y': float(row.iloc[2]) if pd.notna(row.iloc[2]) else 0,
-                        'capacity': float(row.iloc[3]) if pd.notna(row.iloc[3]) else 140,
-                        'fixed_cost': float(row.iloc[4]) if pd.notna(row.iloc[4]) else 10000,
-                    }
-                    instance_data['depots'].append(depot)
-                except:
-                    pass
-            
-            elif 'vehicle capacity' in str(row.iloc[5]) if len(row) > 5 and pd.notna(row.iloc[5]) else False:
-                try:
-                    instance_data['vehicle_capacity'] = float(row.iloc[6]) if len(row) > 6 and pd.notna(row.iloc[6]) else 150
-                except:
-                    pass
-        
-        for idx, row in df.iterrows():
-            try:
-                first_cell = str(row.iloc[0]) if pd.notna(row.iloc[0]) else ""
-                if first_cell.replace('.', '').replace('-', '').isdigit() and not first_cell.startswith('d'):
-                    cust_id = int(float(first_cell))
-                    if 1 <= cust_id <= 500:
-                        customer = {
-                            'id': cust_id,
-                            'x': float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0,
-                            'y': float(row.iloc[2]) if pd.notna(row.iloc[2]) else 0,
-                            'demand': float(row.iloc[3]) if pd.notna(row.iloc[3]) else 10,
-                        }
-                        instance_data['customers'].append(customer)
-            except:
-                continue
-        
-        instance_data['n_depots'] = len(instance_data['depots'])
-        instance_data['n_customers'] = len(instance_data['customers'])
-        instance_data['emission_factor'] = 0.120
-        instance_data['fuel_cost'] = 0.23
-        
-        return instance_data
+            log(f"  [skip] {sheet}: {e}")
+    return out
 
 
 # ============================================================================
-# FREIGHT ROUTING PROBLEM CLASS
+# AMBIGUITY SET + DRO EVALUATOR
 # ============================================================================
+@dataclass
+class AmbiguitySet:
+    W_lower: np.ndarray; W_upper: np.ndarray
+    mean_hat: np.ndarray; mean_lower: np.ndarray; mean_upper: np.ndarray
+    Sigma: np.ndarray; sigma_f: np.ndarray; sigma_b: np.ndarray
+    H_sigma: np.ndarray
 
-class FreightRoutingProblem:
-    def __init__(self, instance_data: Dict, carbon_price: float = 500.0):
-        self.instance = instance_data
-        self.carbon_price = carbon_price / 1000.0
-        self.name = instance_data['name']
-        self.is_green = instance_data.get('is_green', False)
-        
-        self.n_depots = instance_data['n_depots']
-        self.n_customers = instance_data['n_customers']
-        self.n_vars = self.n_customers
-        self.n_obj = 2
-        
-        self.emission_factor = instance_data.get('emission_factor', 0.120)
-        self.fuel_cost = instance_data.get('fuel_cost', 0.23)
-        self.vehicle_capacity = instance_data.get('vehicle_capacity', 150)
-        self.route_fixed_cost = instance_data.get('route_fixed_cost', 1000)
-        
-        self.depot_coords = [(d['x'], d['y']) for d in instance_data['depots']]
-        self.depot_fixed_costs = [d['fixed_cost'] for d in instance_data['depots']]
-        self.customer_coords = [(c['x'], c['y']) for c in instance_data['customers']]
-        self.demands = [c['demand'] for c in instance_data['customers']]
-        
-        if self.n_depots > 0 and self.n_customers > 0:
-            all_coords = self.depot_coords + self.customer_coords
-            self.distances = cdist(all_coords, all_coords, metric='euclidean')
+    def dimension(self): return len(self.mean_hat)
+
+    @staticmethod
+    def from_residuals(residuals, confidence=0.95):
+        residuals = np.atleast_2d(residuals)
+        n, d = residuals.shape
+        W_lower = residuals.min(axis=0); W_upper = residuals.max(axis=0)
+        mean_hat = residuals.mean(axis=0)
+        std = residuals.std(axis=0, ddof=1) if n > 1 else np.zeros(d)
+        z = stats.norm.ppf((1 + confidence) / 2)
+        margin = z * std / np.sqrt(max(n, 1))
+        mean_lower = mean_hat - margin; mean_upper = mean_hat + margin
+        Sigma = np.cov(residuals, rowvar=False) if n > 1 else np.eye(d)
+        if Sigma.ndim == 0: Sigma = np.array([[float(Sigma)]])
+        Sigma = 0.9 * Sigma + 0.1 * np.diag(np.diag(Sigma)) + 1e-8 * np.eye(d)
+        sigma_f = AmbiguitySet._dd(residuals, +1)
+        sigma_b = AmbiguitySet._dd(residuals, -1)
+        eigvals, eigvecs = np.linalg.eigh(Sigma)
+        eigvals = np.clip(eigvals, 1e-10, None)
+        H = (eigvecs / np.sqrt(eigvals)).T
+        return AmbiguitySet(W_lower, W_upper, mean_hat, mean_lower,
+                            mean_upper, Sigma, sigma_f, sigma_b, H)
+
+    @staticmethod
+    def _dd(residuals, sign):
+        theta_grid = np.logspace(-3, 1, 40)
+        r = sign * residuals
+        n, d = r.shape
+        out = np.zeros(d)
+        for j in range(d):
+            x = r[:, j]
+            zz = theta_grid[:, None] * x[None, :]
+            m = zz.max(axis=1)
+            lme = m + np.log(np.mean(np.exp(zz - m[:, None]), axis=1))
+            val = np.sqrt(np.maximum(2.0 * lme / theta_grid ** 2, 0.0))
+            out[j] = float(val.max())
+        return out
+
+
+class DROEvaluator:
+    _LAM_GRID = np.logspace(-3, 2, 60)
+
+    def __init__(self, amb):
+        self.amb = amb
+        self._cache = {}
+
+    def _coeffs(self, r):
+        key = r.tobytes()
+        c = self._cache.get(key)
+        if c is not None: return c
+        wm = float(np.sum(np.where(r >= 0, r * self.amb.mean_upper,
+                                          r * self.amb.mean_lower)))
+        ws = float(np.sum(np.where(r >= 0, r * self.amb.W_upper,
+                                          r * self.amb.W_lower)))
+        u = np.maximum(r * self.amb.sigma_f, -r * self.amb.sigma_b)
+        nu2 = float(u @ u)
+        var = max(float(r @ self.amb.Sigma @ r), 0.0)
+        c = (wm, ws, nu2, var)
+        if len(self._cache) > 4096: self._cache.clear()
+        self._cache[key] = c
+        return c
+
+    def pi1(self, r0, r):
+        r = np.asarray(r, dtype=float).flatten()
+        wm, ws, _, _ = self._coeffs(r)
+        return max(0.0, r0 + max(ws, wm))
+
+    def pi2(self, r0, r):
+        r = np.asarray(r, dtype=float).flatten()
+        wm, _, _, var = self._coeffs(r)
+        mu = r0 + wm
+        return (0.5 * mu + 0.5 * np.sqrt(mu ** 2 + var)) if mu >= 0 \
+               else 0.5 * np.sqrt(var)
+
+    def pi3(self, r0, r):
+        r = np.asarray(r, dtype=float).flatten()
+        wm, ws, nu2, _ = self._coeffs(r)
+        x0 = r0 + wm; sup_z = ws
+        lams = self._LAM_GRID
+        e = (x0 + sup_z) / lams + nu2 / (2.0 * lams ** 2)
+        log_v = np.log(lams) - 1.0 + e
+        v = np.exp(np.minimum(log_v, 700.0))
+        v = np.where(e > 50.0, np.inf, v)
+        if not np.any(np.isfinite(v)): return self.pi1(r0, r)
+        return float(np.min(v))
+
+    def pi(self, r0, r):
+        return max(self.pi1(r0, r), self.pi2(r0, r), self.pi3(r0, r))
+
+
+# ============================================================================
+# LC-CLRP  (identical to consolidated script)
+# ============================================================================
+class LCCLRP:
+    def __init__(self, instance, evaluation_mode='dro'):
+        self.instance = instance
+        self.n_var = instance.n_customers
+        self.n_obj = 3
+        self.evaluation_mode = evaluation_mode
+        if evaluation_mode not in ('deterministic', 'stochastic', 'dro'):
+            raise ValueError(f"Unknown evaluation_mode={evaluation_mode!r}")
+        self.depot_list = list(instance.depots.keys())
+        self.customer_list = list(instance.customers.keys())
+        pts = [(instance.depots[d]["x"], instance.depots[d]["y"]) for d in self.depot_list]
+        pts += [(instance.customers[c]["x"], instance.customers[c]["y"]) for c in self.customer_list]
+        pts = np.array(pts, dtype=float)
+        self.D = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+        self.n_depots = instance.n_depots
+        self.n_customers = instance.n_customers
+        self._demands = np.array([instance.customers[c]["demand"] for c in self.customer_list], dtype=float)
+        self._depot_caps = np.array([instance.depots[d]["capacity"] for d in self.depot_list], dtype=float)
+        self._depot_open_cost = np.array([instance.depots[d]["opening_cost"] for d in self.depot_list], dtype=float)
+        self._depot_fixed_em = np.array([instance.depots[d].get("fixed_emission", 0.0) for d in self.depot_list], dtype=float)
+        self._build_stochastic_grid()
+        self._build_ambiguity_set()
+        self.dro = DROEvaluator(self.ambiguity)
+
+    def _build_ambiguity_set(self):
+        dm = np.array([0.85, 0.95, 1.00, 1.05, 1.15])
+        tm = np.array([0.90, 0.95, 1.00, 1.10, 1.30])
+        em = np.array([0.95, 0.98, 1.00, 1.02, 1.05])
+        probs = np.array([0.15, 0.20, 0.30, 0.20, 0.15])
+        res = np.column_stack([dm - 1, tm - 1, em - 1])
+        w = probs / probs.sum()
+        rng = np.random.default_rng(hash(self.instance.name) % 2 ** 32)
+        idx = rng.choice(len(res), size=max(50, len(res) * 20), p=w, replace=True)
+        self.ambiguity = AmbiguitySet.from_residuals(res[idx], 0.95)
+
+    def _build_stochastic_grid(self):
+        dm = np.array([0.85, 0.95, 1.00, 1.05, 1.15])
+        tm = np.array([0.90, 0.95, 1.00, 1.10, 1.30])
+        em = np.array([0.95, 0.98, 1.00, 1.02, 1.05])
+        probs = np.array([0.15, 0.20, 0.30, 0.20, 0.15])
+        probs = probs / probs.sum()
+        grid = np.array([[a, b, c] for a in dm for b in tm for c in em], dtype=float)
+        joint = np.array([pa * pb * pc for pa in probs for pb in probs for pc in probs], dtype=float)
+        joint = joint / joint.sum()
+        self._stoch_grid = grid; self._stoch_weights = joint
+
+    def _decode(self, x):
+        x = np.clip(np.asarray(x, dtype=float), 0, 1)
+        if self.n_depots > 0:
+            flags = x[:self.n_depots] >= 0.5
+            if not np.any(flags):
+                flags[np.argmax(x[:self.n_depots])] = True
+            open_depots = [i for i, f in enumerate(flags) if f]
         else:
-            self.distances = np.zeros((1, 1))
-    
-    def decode(self, x: np.ndarray) -> Dict:
-        if self.n_depots == 0:
-            return {'depot_customers': {}, 'active_depots': []}
-        assignments = (x[:self.n_customers] * self.n_depots).astype(int)
-        assignments = np.clip(assignments, 0, self.n_depots - 1)
-        depot_customers = {i: [] for i in range(self.n_depots)}
-        for cust_idx, depot_idx in enumerate(assignments):
-            depot_customers[depot_idx].append(cust_idx)
-        return {
-            'depot_customers': depot_customers,
-            'active_depots': [d for d in range(self.n_depots) if depot_customers[d]]
-        }
-    
-    def solve_tsp_nearest_neighbor(self, depot_idx: int, customers: List[int]) -> Tuple[float, List[int]]:
-        if not customers:
-            return 0.0, []
-        depot_node = depot_idx
-        cust_nodes = [self.n_depots + c for c in customers]
-        route = [depot_node]
-        remaining = cust_nodes.copy()
-        current = depot_node
-        while remaining:
-            dists = [self.distances[current, n] for n in remaining]
-            nearest = np.argmin(dists)
-            current = remaining.pop(nearest)
-            route.append(current)
-        route.append(depot_node)
-        total_dist = sum(self.distances[route[i], route[i+1]] for i in range(len(route)-1))
-        return total_dist, route
-    
-    def evaluate_route(self, depot_idx: int, customers: List[int]) -> Tuple[float, float]:
-        if not customers:
-            return 0.0, 0.0
-        total_demand = sum(self.demands[c] for c in customers)
-        if total_demand > self.vehicle_capacity:
-            penalty = 1e5 * (total_demand / self.vehicle_capacity) ** 2
-            return penalty, penalty
-        
-        distance, _ = self.solve_tsp_nearest_neighbor(depot_idx, customers)
-        transport_cost = distance * self.fuel_cost
-        emissions = distance * self.emission_factor
-        return transport_cost + self.route_fixed_cost, emissions
-    
-    def evaluate(self, x: np.ndarray) -> Tuple[float, float]:
-        if self.n_depots == 0 or self.n_customers == 0:
-            return 1e6, 1e6
-        
-        decoded = self.decode(x)
-        total_cost = 0.0
-        total_emissions = 0.0
-        
-        for depot_idx in decoded['active_depots']:
-            total_cost += self.depot_fixed_costs[depot_idx]
-        
-        for depot_idx, customers in decoded['depot_customers'].items():
-            if not customers:
-                continue
-            remaining = customers.copy()
-            while remaining:
-                route_customers = []
-                current_demand = 0
-                depot_node = depot_idx
-                customers_with_dist = [(c, self.distances[depot_node, self.n_depots + c]) for c in remaining]
-                customers_with_dist.sort(key=lambda t: t[1])
-                for cust, _ in customers_with_dist:
-                    if current_demand + self.demands[cust] <= self.vehicle_capacity:
-                        route_customers.append(cust)
-                        current_demand += self.demands[cust]
-                if route_customers:
-                    cost, emissions = self.evaluate_route(depot_idx, route_customers)
-                    total_cost += cost
-                    total_emissions += emissions
-                    for cust in route_customers:
-                        remaining.remove(cust)
-                else:
-                    break
-        
-        return total_cost + total_emissions * self.carbon_price, total_emissions
+            open_depots = [0]
+        og = x[self.n_depots:self.n_depots + self.n_customers]
+        if len(og) < self.n_customers:
+            og = np.pad(og, (0, self.n_customers - len(og)), constant_values=0.5)
+        order = np.argsort(og)
+        caps = {d: self._depot_caps[d] for d in open_depots}
+        demands = self._demands; Dloc = self.D; n_dep = self.n_depots
+        vcap = self.instance.vehicle_capacity
+        routes = []
+        for c in order:
+            dem = demands[c]
+            best_d, best_dist = None, np.inf
+            for d in open_depots:
+                if caps[d] < dem: continue
+                dd = Dloc[d, n_dep + c]
+                if dd < best_dist: best_dist = dd; best_d = d
+            if best_d is None:
+                best_d = max(open_depots, key=lambda d: caps[d])
+            placed = False
+            for r_i, (dep, seq, load) in enumerate(routes):
+                if dep != best_d: continue
+                if load + dem <= vcap:
+                    seq.append(c); routes[r_i] = (dep, seq, load + dem)
+                    placed = True; break
+            if not placed: routes.append((best_d, [c], dem))
+            caps[best_d] -= dem
+        route_nodes = [(dep, [n_dep + c for c in seq]) for dep, seq, _ in routes]
+        return open_depots, route_nodes
+
+    def decode_routes(self, x): return self._decode(x)
+
+    def _nominal_evaluate(self, x, return_L=False):
+        try:
+            open_depots, routes = self._decode(x)
+        except Exception:
+            return (1e10, 1e10, 1e10, 0.0) if return_L else (1e10, 1e10, 1e10)
+        depot_cost = float(self._depot_open_cost[open_depots].sum()) if open_depots else 0.0
+        depot_em = float(self._depot_fixed_em[open_depots].sum()) if open_depots else 0.0
+        d_cost = 0.0; d_em = 0.0; t_tot = 0.0; veh_fix = 0.0
+        p = self.instance.params; Dloc = self.D; n_dep = self.n_depots
+        demands = self._demands
+        vcap = max(self.instance.vehicle_capacity, 1.0)
+        for dep, seq in routes:
+            veh_fix += self.instance.vehicle_fixed_cost
+            path = [dep] + seq + [dep]
+            load = sum(demands[c - n_dep] for c in seq)
+            for i in range(len(path) - 1):
+                a, b = path[i], path[i + 1]
+                dkm = Dloc[a, b]; lf = load / vcap
+                fpk = p.diesel_cons_empty + (p.diesel_cons_full - p.diesel_cons_empty) * lf
+                d_cost += fpk * dkm * p.diesel_unit_cost
+                d_em += fpk * dkm * p.emission_coefficient
+                t_tot += dkm / p.avg_speed_kmh
+                if b >= n_dep:
+                    ci = b - n_dep
+                    load -= demands[ci]
+                    if load < 0.0: load = 0.0
+            t_tot += p.service_time_h * len(seq)
+        carbon_cost = p.carbon_treatment_cost * d_em
+        res = (float(depot_cost + veh_fix + d_cost + carbon_cost),
+               float(depot_em + d_em), float(t_tot))
+        if return_L:
+            L_total = 0.0
+            for dep, seq in routes:
+                path = [dep] + seq + [dep]
+                L_total += float(sum(Dloc[path[i], path[i + 1]] for i in range(len(path) - 1)))
+            return res, L_total
+        return res
+
+    def _exact_sensitivities(self, x, L_total):
+        p = self.instance.params
+        b_time_tau = L_total / p.avg_speed_kmh
+        b_em_gamma = L_total * p.emission_coefficient
+        total_demand = float(self._demands.sum()) if self._demands.size else 1.0
+        dL = L_total / max(total_demand, 1.0)
+        b_cost_d = dL * p.diesel_unit_cost * (p.diesel_cons_empty + p.diesel_cons_full) / 2.0
+        b_cost_gamma = L_total * p.emission_coefficient * p.carbon_treatment_cost
+        return (np.nan_to_num(np.array([b_cost_d, 0.0, b_cost_gamma])),
+                np.nan_to_num(np.array([0.0, 0.0, b_em_gamma])),
+                np.nan_to_num(np.array([0.0, b_time_tau, 0.0])))
+
+    def evaluate(self, x):
+        (bc, be, bt), L_total = self._nominal_evaluate(x, return_L=True)
+        if self.evaluation_mode == 'deterministic':
+            return (float(bc), float(be), float(bt))
+        if self.evaluation_mode == 'stochastic':
+            return self._stochastic_evaluate(x)
+        b_cost, b_em, b_time = self._exact_sensitivities(x, L_total)
+        return (float(self.dro.pi(bc, b_cost)),
+                float(self.dro.pi(be, b_em)),
+                float(self.dro.pi(bt, b_time)))
+
+    def evaluate_deterministic(self, x): return self._nominal_evaluate(x)
+
+    def _stochastic_evaluate(self, x, n_samples=150):
+        try:
+            open_depots, routes = self._decode(x)
+        except Exception:
+            return 1e10, 1e10, 1e10
+        p = self.instance.params; Dloc = self.D; n_dep = self.n_depots
+        demands = self._demands
+        vcap = max(self.instance.vehicle_capacity, 1.0)
+        depot_cost = float(self._depot_open_cost[open_depots].sum()) if open_depots else 0.0
+        depot_em = float(self._depot_fixed_em[open_depots].sum()) if open_depots else 0.0
+        legs_cost = []; legs_em = []; legs_time = []
+        veh_fix = 0.0; service_time_total = 0.0
+        for dep, seq in routes:
+            veh_fix += self.instance.vehicle_fixed_cost
+            path = [dep] + seq + [dep]
+            load = sum(demands[c - n_dep] for c in seq)
+            for i in range(len(path) - 1):
+                a, b = path[i], path[i + 1]
+                dkm = Dloc[a, b]; lf = load / vcap
+                fpk = p.diesel_cons_empty + (p.diesel_cons_full - p.diesel_cons_empty) * lf
+                legs_cost.append(fpk * dkm * p.diesel_unit_cost)
+                legs_em.append(fpk * dkm * p.emission_coefficient)
+                legs_time.append(dkm / p.avg_speed_kmh)
+                if b >= n_dep:
+                    ci = b - n_dep
+                    load -= demands[ci]
+                    if load < 0.0: load = 0.0
+            service_time_total += p.service_time_h * len(seq)
+        if not legs_cost:
+            return (float(depot_cost + veh_fix), float(depot_em), float(service_time_total))
+        legs_cost = np.asarray(legs_cost, dtype=float)
+        legs_em = np.asarray(legs_em, dtype=float)
+        legs_time = np.asarray(legs_time, dtype=float)
+        rng = np.random.default_rng(hash((self.instance.name, 'stoch')) % 2 ** 32)
+        idx = rng.choice(len(self._stoch_grid), size=n_samples, p=self._stoch_weights)
+        scen = self._stoch_grid[idx]
+        cost_m = scen[:, 0]; time_m = scen[:, 1]; emis_m = scen[:, 2]
+        s_cost_travel = (cost_m[:, None] * legs_cost[None, :]).sum(axis=1)
+        s_em_travel = (emis_m[:, None] * legs_em[None, :]).sum(axis=1)
+        s_time_travel = (time_m[:, None] * legs_time[None, :]).sum(axis=1)
+        s_cost = depot_cost + veh_fix + s_cost_travel + p.carbon_treatment_cost * s_em_travel
+        s_em = depot_em + s_em_travel
+        s_time = s_time_travel + service_time_total
+        return (float(s_cost.mean()), float(s_em.mean()), float(s_time.mean()))
 
 
 # ============================================================================
-# INITIALIZATION METHODS (COST GREEDY REMOVED)
+# CONFIG
 # ============================================================================
+@dataclass
+class DROEMOConfig:
+    population_size: int = 100
+    generations_small: int = 80
+    generations_medium: int = 100
+    generations_large: int = 120
 
-class PPOAdaptiveInit:
-    """PPO-Adaptive: size-adaptive, ensemble, 4 strategies"""
-    
-    def __init__(self, problem: FreightRoutingProblem):
-        self.problem = problem
-        self.name = "PPO-Adaptive"
-        self.pop_size = 100
-        self._configure_for_size()
-    
-    def _configure_for_size(self):
-        n = self.problem.n_customers
-        if n < 50:
-            self.biased_ratio = 0.1
-            self.bias_factor = 0.3
-        elif n < 100:
-            self.biased_ratio = 0.2
-            self.bias_factor = 0.2
+    ppo_learning_rate: float = 3e-4
+    ppo_clip_epsilon: float = 0.2
+    ppo_gamma: float = 0.99
+    ppo_gae_lambda: float = 0.95
+    ppo_training_episodes: int = 2000
+
+    ppo_proportion: float = 0.30
+    heuristic_proportion: float = 0.30
+    random_proportion: float = 0.30
+    opposite_proportion: float = 0.10
+
+    exploitation_base: float = 0.85
+    exploration_base: float = 0.15
+
+    local_search_frequency: int = 10
+    local_search_top_proportion: float = 0.10
+    local_search_epsilon: float = 0.02
+    local_search_iterations: int = 40
+
+    archive_size_ratio: float = 0.5
+
+    diversity_reset_threshold: float = 0.15
+    diversity_reset_min_interval: int = 20
+    diversity_reset_proportion: float = 0.15
+
+    hv_stride: int = 5
+
+    use_dro_bound: bool = True
+    use_ppo_init: bool = True
+    use_adaptive_operators: bool = True
+    use_local_search: bool = True
+
+    def get_generations(self, n):
+        if n <= 30: return 150
+        if n <= 60: return 120
+        if n <= 120: return 100
+        return 90
+
+    def get_population(self, n):
+        if n <= 30: return 60
+        if n <= 60: return 80
+        if n <= 120: return 100
+        return 100
+
+
+@dataclass
+class ExperimentConfig:
+    num_runs: int = 30
+    base_seed: int = 42
+    dro_emo: DROEMOConfig = field(default_factory=DROEMOConfig)
+
+    def get_seed(self, run_id): return self.base_seed + run_id
+
+
+# ============================================================================
+# PPO AGENT
+# ============================================================================
+class PPOAgent:
+    def __init__(self, sd, ad, cfg):
+        self.sd = sd; self.ad = ad
+        self.pw = np.random.randn(sd, ad) * 0.01
+        self.vw = np.random.randn(sd, 1) * 0.01
+        self.opw = self.pw.copy()
+        self.lr = cfg.ppo_learning_rate
+        self.ce = cfg.ppo_clip_epsilon
+        self.ga = cfg.ppo_gamma; self.gl = cfg.ppo_gae_lambda
+
+    def get_action(self, s, bf=0.0, ew=None):
+        if s.ndim > 1: s = s.flatten()
+        s = np.pad(s, (0, max(0, self.sd - len(s))))[:self.sd]
+        lg = s @ self.pw
+        if ew is not None and bf > 0:
+            ew = np.pad(ew, (0, max(0, len(lg) - len(ew))))[:len(lg)]
+            lg = lg - bf * ew
+        p = self._sm(lg); p = np.nan_to_num(p, nan=1.0 / self.ad)
+        p = p / max(p.sum(), 1e-10)
+        a = np.random.choice(self.ad, p=p); return a, p[a]
+
+    def update(self, S, A, R, NS, D):
+        if S.ndim == 1: S = S.reshape(1, -1)
+        if NS.ndim == 1: NS = NS.reshape(1, -1)
+        if S.shape[1] < self.sd:
+            pad = ((0, 0), (0, self.sd - S.shape[1]))
+            S = np.pad(S, pad); NS = np.pad(NS, pad)
         else:
-            self.biased_ratio = 0.3
-            self.bias_factor = 0.1
-        
-        if self.problem.is_green:
-            self.biased_ratio = min(0.4, self.biased_ratio + 0.05)
-    
-    def _ppo_biased_init(self) -> np.ndarray:
-        depot_costs = self.problem.depot_fixed_costs
-        best_depots = np.argsort(depot_costs)[:max(1, self.problem.n_depots // 2)]
-        ind = np.random.rand(self.problem.n_vars)
-        for bd in best_depots:
-            mask = np.random.rand(self.problem.n_vars) < 0.2
-            ind[mask] = (bd / self.problem.n_depots) + np.random.normal(0, self.bias_factor, np.sum(mask))
-        return np.clip(ind, 0, 0.99)
-    
-    def _nearest_neighbor_init(self) -> np.ndarray:
-        ind = np.zeros(self.problem.n_vars)
-        for i, cust_coord in enumerate(self.problem.customer_coords):
-            distances = [np.linalg.norm(np.array(cust_coord) - np.array(depot_coord)) 
-                        for depot_coord in self.problem.depot_coords]
-            ind[i] = np.argmin(distances) / self.problem.n_depots
-        return ind
-    
-    def _random_init(self) -> np.ndarray:
-        return np.random.rand(self.problem.n_vars)
-    
-    def _opposite_bias_init(self) -> np.ndarray:
-        depot_costs = self.problem.depot_fixed_costs
-        worst_depots = np.argsort(depot_costs)[-self.problem.n_depots // 2:]
-        ind = np.random.rand(self.problem.n_vars)
-        for wd in worst_depots:
-            mask = np.random.rand(self.problem.n_vars) < 0.15
-            ind[mask] = wd / self.problem.n_depots
-        return np.clip(ind, 0, 0.99)
-    
-    def initialize_population(self) -> List[np.ndarray]:
-        population = []
-        n_ppo = max(1, int(self.pop_size * self.biased_ratio))
-        n_heuristic = max(1, int(self.pop_size * 0.3))
-        n_random = max(1, int(self.pop_size * 0.3))
-        n_opposite = self.pop_size - n_ppo - n_heuristic - n_random
-        
-        for _ in range(n_ppo): population.append(self._ppo_biased_init())
-        for _ in range(n_heuristic): population.append(self._nearest_neighbor_init())
-        for _ in range(n_random): population.append(self._random_init())
-        for _ in range(n_opposite): population.append(self._opposite_bias_init())
-        
-        random.shuffle(population)
-        while len(population) < self.pop_size: population.append(self._random_init())
-        return population[:self.pop_size]
-    
-    def evaluate(self):
-        pop = self.initialize_population()
-        total_cost = 0
-        total_emissions = 0
-        best_cost = float('inf')
-        best_emissions = float('inf')
-        
-        for ind in pop:
-            cost, emissions = self.problem.evaluate(ind)
-            total_cost += cost
-            total_emissions += emissions
-            if cost < best_cost:
-                best_cost = cost
-            if emissions < best_emissions:
-                best_emissions = emissions
-        
-        return {
-            'avg_cost': total_cost / self.pop_size,
-            'avg_emissions': total_emissions / self.pop_size,
-            'best_cost': best_cost,
-            'best_emissions': best_emissions
-        }
+            S = S[:, :self.sd]; NS = NS[:, :self.sd]
+        aoh = np.zeros((len(A), self.ad)); aoh[np.arange(len(A)), A] = 1
+        v = S @ self.vw; nv = NS @ self.vw
+        dl = R + self.ga * (1 - D) * nv.flatten() - v.flatten()
+        dl = np.nan_to_num(dl, nan=0.0)
+        adv = np.zeros_like(dl); a = 0
+        for t in reversed(range(len(dl))):
+            a = dl[t] + self.ga * self.gl * (1 - D[t]) * a; adv[t] = a
+        if len(adv) > 1 and np.std(adv) > 1e-8:
+            adv = (adv - adv.mean()) / adv.std()
+        op = self._sm(S @ self.opw); oa = op[np.arange(len(A)), A] + 1e-8
+        np_ = self._sm(S @ self.pw); na = np_[np.arange(len(A)), A] + 1e-8
+        ratio = np.nan_to_num(na / oa, nan=1.0, posinf=1 + self.ce, neginf=1 - self.ce)
+        cl = np.clip(ratio, 1 - self.ce, 1 + self.ce)
+        obj = np.minimum(ratio * adv, cl * adv)
+        g = S.T @ ((obj[:, None] * (aoh - np_)) / np_)
+        self.pw += self.lr * np.nan_to_num(g, nan=0.0)
+        td = R + self.ga * (1 - D) * (NS @ self.vw).flatten() - v.flatten()
+        self.vw += self.lr * S.T @ np.nan_to_num(td, nan=0.0)[:, None]
+        self.opw = self.pw.copy()
+        return float(np.mean(obj)) if len(obj) else 0.0
+
+    def _sm(self, x):
+        x = np.nan_to_num(x, nan=0.0, posinf=100.0, neginf=-100.0)
+        e = np.exp(x - np.max(x, axis=-1, keepdims=True))
+        return e / np.maximum(np.sum(e, axis=-1, keepdims=True), 1e-10)
 
 
-class ClassicPPOInit:
-    """Classic PPO: fixed parameters, single strategy"""
-    
-    def __init__(self, problem: FreightRoutingProblem):
-        self.problem = problem
-        self.name = "Classic PPO"
-        self.pop_size = 100
-        self.biased_ratio = 0.2
-        self.bias_factor = 0.2
-    
-    def _ppo_biased_init(self) -> np.ndarray:
-        depot_costs = self.problem.depot_fixed_costs
-        best_depots = np.argsort(depot_costs)[:max(1, self.problem.n_depots // 2)]
-        ind = np.random.rand(self.problem.n_vars)
-        for bd in best_depots:
-            mask = np.random.rand(self.problem.n_vars) < 0.2
-            ind[mask] = (bd / self.problem.n_depots) + np.random.normal(0, self.bias_factor, np.sum(mask))
-        return np.clip(ind, 0, 0.99)
-    
-    def _random_init(self) -> np.ndarray:
-        return np.random.rand(self.problem.n_vars)
-    
-    def initialize_population(self) -> List[np.ndarray]:
-        population = []
-        n_biased = int(self.pop_size * self.biased_ratio)
-        for i in range(self.pop_size):
-            if i < n_biased:
-                population.append(self._ppo_biased_init())
+# ============================================================================
+# SHARED MOEA UTILITIES
+# ============================================================================
+def _dominates(a, b):
+    one = False
+    for ai, bi in zip(a, b):
+        if ai > bi: return False
+        if ai < bi: one = True
+    return one
+
+
+def non_dominated_sort(fit):
+    n = len(fit)
+    if n == 0: return []
+    dom = [set() for _ in range(n)]; dc = [0] * n
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _dominates(fit[i], fit[j]): dom[i].add(j); dc[j] += 1
+            elif _dominates(fit[j], fit[i]): dom[j].add(i); dc[i] += 1
+    front = [i for i in range(n) if dc[i] == 0]
+    fronts = [list(front)]
+    while front:
+        nxt = []
+        for i in front:
+            for j in dom[i]:
+                dc[j] -= 1
+                if dc[j] == 0: nxt.append(j)
+        front = nxt
+        if front: fronts.append(list(front))
+    return fronts
+
+
+def crowding_distance(fit, idx):
+    m = len(fit[0]); n = len(idx)
+    if n == 0: return np.array([])
+    if n <= 2: return np.full(n, np.inf)
+    d = np.zeros(n)
+    for k in range(m):
+        vals = np.array([fit[i][k] for i in idx])
+        order = np.argsort(vals)
+        d[order[0]] = np.inf; d[order[-1]] = np.inf
+        rng = vals[order[-1]] - vals[order[0]]
+        if rng <= 1e-12: continue
+        for i in range(1, n - 1):
+            d[order[i]] += (vals[order[i + 1]] - vals[order[i - 1]]) / rng
+    return d
+
+
+# ============================================================================
+# DRO-EMO
+# ============================================================================
+class DROEMO:
+    name = 'dro_emo'
+    _CACHE_MAX = 50000
+
+    def __init__(self, problem, cfg):
+        self.problem = problem; self.cfg = cfg
+        self.pop_size = cfg.get_population(problem.n_var)
+        self.max_gen = cfg.get_generations(problem.n_var)
+        self.n_var = problem.n_var; self.n_obj = problem.n_obj
+        sd = min(self.n_var + 4, 50); ad = min(self.n_var * 3, 100)
+        self.ppo = PPOAgent(sd, ad, cfg)
+        if cfg.use_ppo_init: self._pretrain()
+        self.population = []; self.fitness = []
+        self.archive = []; self.history = {'hypervolume': [], 'diversity': []}
+        self._last_reset = -9999
+        self._eval_cache: Dict[bytes, Tuple[float, float, float]] = {}
+
+    def _pretrain(self):
+        for _ in range(min(20, self.cfg.ppo_training_episodes // 10)):
+            bs = 5
+            s = np.random.randn(bs, self.ppo.sd)
+            a = np.random.randint(0, self.ppo.ad, bs)
+            r = np.random.randn(bs); ns = np.random.randn(bs, self.ppo.sd)
+            self.ppo.update(s, a, r, ns, np.zeros(bs))
+
+    def _enc(self, x):
+        s = np.zeros(self.ppo.sd); n = min(len(x), self.ppo.sd - 4)
+        s[:n] = x[:n] / 10.0; return s
+
+    def init_pop(self):
+        if not self.cfg.use_ppo_init:
+            return [np.random.uniform(0, 1, self.n_var) for _ in range(self.pop_size)]
+        pop = []
+        n_ppo = max(1, int(self.pop_size * self.cfg.ppo_proportion))
+        n_h = max(1, int(self.pop_size * self.cfg.heuristic_proportion))
+        n_r = max(1, int(self.pop_size * self.cfg.random_proportion))
+        for _ in range(n_ppo):
+            seed = np.random.uniform(0, 1, self.n_var)
+            a, _ = self.ppo.get_action(self._enc(seed), bf=0.3)
+            guided = seed.copy()
+            if self.n_var > 0:
+                guided[a % self.n_var] = np.clip(guided[a % self.n_var] + 0.3, 0.0, 1.0)
+            pop.append(guided)
+        for _ in range(n_h):
+            x = np.random.uniform(0, 1, self.n_var)
+            no = max(1, self.problem.n_depots // 2)
+            nd = self.problem.n_depots
+            if nd > 0:
+                caps = self.problem._depot_caps
+                top = np.argsort(caps)[::-1][:no]
+                x[:nd] = 0.0; x[top] = 1.0
+            pop.append(x)
+        for _ in range(n_r):
+            pop.append(np.random.uniform(0, 1, self.n_var))
+        while len(pop) < self.pop_size:
+            pop.append(1.0 - np.random.uniform(0, 1, self.n_var))
+        return pop[:self.pop_size]
+
+    def evaluate(self, x):
+        key = np.asarray(x, dtype=float).tobytes()
+        cached = self._eval_cache.get(key)
+        if cached is not None: return cached
+        try:
+            if self.cfg.use_dro_bound:
+                val = self.problem.evaluate(x)
             else:
-                population.append(self._random_init())
-        return population
-    
-    def evaluate(self):
-        pop = self.initialize_population()
-        total_cost = 0
-        total_emissions = 0
-        best_cost = float('inf')
-        best_emissions = float('inf')
-        
-        for ind in pop:
-            cost, emissions = self.problem.evaluate(ind)
-            total_cost += cost
-            total_emissions += emissions
-            if cost < best_cost:
-                best_cost = cost
-            if emissions < best_emissions:
-                best_emissions = emissions
-        
-        return {
-            'avg_cost': total_cost / self.pop_size,
-            'avg_emissions': total_emissions / self.pop_size,
-            'best_cost': best_cost,
-            'best_emissions': best_emissions
-        }
+                val = self.problem.evaluate_deterministic(x)
+        except Exception:
+            val = (1e10, 1e10, 1e10)
+        if len(self._eval_cache) >= self._CACHE_MAX: self._eval_cache.clear()
+        self._eval_cache[key] = val
+        return val
+
+    def _crowd(self, front, fit=None):
+        n = len(front)
+        if n <= 2: return [float('inf')] * n
+        if fit is None: fit = [self.evaluate(s) for s in front]
+        d = [0.0] * n; m = len(fit[0])
+        for k in range(m):
+            order = sorted(range(n), key=lambda i: fit[i][k])
+            d[order[0]] = float('inf'); d[order[-1]] = float('inf')
+            lo, hi = fit[order[0]][k], fit[order[-1]][k]
+            rng = hi - lo if hi > lo else 1.0
+            for i in range(1, n - 1):
+                d[order[i]] += (fit[order[i + 1]][k] - fit[order[i - 1]][k]) / rng
+        return d
+
+    def _div(self, pop):
+        if not pop: return 0.0
+        return len(set(tuple(np.round(p, 6)) for p in pop)) / len(pop)
+
+    def _conv_state(self, pop):
+        if not pop: return 0.0
+        fit = [self.evaluate(p) for p in pop]; m = len(fit[0]); tot = 0.0
+        for k in range(m):
+            vals = [f[k] for f in fit if np.isfinite(f[k])]
+            if not vals: continue
+            lo, hi = min(vals), max(vals); rng = hi - lo if hi > lo else 1.0
+            tot += np.mean([(v - lo) / rng for v in vals])
+        return float(tot / m) if np.isfinite(tot) else 0.0
+
+    def _ops(self, gen):
+        if not self.cfg.use_adaptive_operators:
+            return (self.cfg.exploitation_base, self.cfg.exploration_base)
+        g, G = gen, max(1, self.max_gen)
+        conv = self._conv_state(self.population)
+        div = self._div(self.population)
+        fb = max(0.5, min(1.5, 1.0 + div - conv))
+        return (max(0.5, min(0.95, self.cfg.exploitation_base * (1 - np.exp(-g / G)) * fb)),
+                max(0.02, min(0.3, self.cfg.exploration_base * np.exp(-g / G) / fb)))
+
+    def _upd_arc(self):
+        mx = int(self.cfg.archive_size_ratio * self.pop_size)
+        fronts = non_dominated_sort(self.fitness)
+        if not fronts: return
+        for i in fronts[0]:
+            s = self.population[i]
+            if len(self.archive) < mx: self.archive.append(s)
+            else:
+                d = self._crowd(self.archive)
+                k = int(np.argmin(d))
+                if d[k] < float('inf'): self.archive[k] = s
+
+    def _reset_arc(self, gen):
+        if not self.archive: return
+        if gen - self._last_reset < self.cfg.diversity_reset_min_interval: return
+        n = min(int(self.cfg.diversity_reset_proportion * self.pop_size), len(self.archive))
+        if n == 0: return
+        sums = [sum(f) for f in self.fitness]
+        worst = sorted(range(len(self.population)), key=lambda i: sums[i], reverse=True)
+        idxs = np.random.choice(len(self.archive), n, replace=False)
+        for i, a in enumerate(idxs):
+            if i < len(worst):
+                self.population[worst[i]] = self.archive[a].copy()
+                self.fitness[worst[i]] = self.evaluate(self.archive[a])
+        self._last_reset = gen
+
+    def _sbx(self, p1, p2, rate):
+        if np.random.random() > rate: return p1.copy()
+        c = p1.copy(); mask = np.random.random(len(p1)) < 0.5
+        c[mask] = p2[mask]; return c
+
+    def _mut(self, x, rate):
+        m = x.copy(); mask = np.random.random(len(x)) < rate
+        m[mask] += np.random.normal(0, 0.1, size=mask.sum())
+        return np.clip(m, 0, 1)
+
+    def _tourn(self, k):
+        sel = []
+        for _ in range(k):
+            i, j = np.random.choice(len(self.population), 2, replace=False)
+            f0, f1 = self.fitness[i], self.fitness[j]
+            if _dominates(f0, f1): sel.append(self.population[i])
+            elif _dominates(f1, f0): sel.append(self.population[j])
+            else: sel.append(self.population[i])
+        return sel
+
+    def _ls(self, x, n=None):
+        n = n or self.cfg.local_search_iterations
+        eps = float(getattr(self.cfg, 'local_search_epsilon', 0.0))
+        best = x.copy(); bf = self.evaluate(best)
+        for it in range(n):
+            c = best.copy()
+            if it < n // 2:
+                i, j = np.random.choice(len(c), 2, replace=False)
+                c[i], c[j] = c[j], c[i]
+            else:
+                nd = self.problem.n_depots
+                if self.n_var >= 2:
+                    i, j = sorted(np.random.choice(self.n_var, 2, replace=False))
+                    seg = c[nd + i: nd + j + 1].copy()
+                    c[nd + i: nd + j + 1] = seg[::-1]
+            cf = self.evaluate(c)
+            if eps > 0.0:
+                if _epsilon_dominates(cf, bf, eps):
+                    best, bf = c, cf
+            else:
+                if _dominates(cf, bf):
+                    best, bf = c, cf
+        return best
+
+    def run(self):
+        self.population = self.init_pop()
+        self.fitness = [self.evaluate(p) for p in self.population]
+        fronts = non_dominated_sort(self.fitness)
+        if fronts:
+            self.archive = [self.population[i]
+                            for i in fronts[0][:int(self.cfg.archive_size_ratio * self.pop_size)]]
+        stride = max(1, int(self.cfg.hv_stride))
+        for gen in range(self.max_gen):
+            div = self._div(self.population)
+            p_c, p_m = self._ops(gen)
+            off = []
+            while len(off) < self.pop_size:
+                p1, p2 = self._tourn(2)
+                c = self._sbx(p1, p2, p_c); c = self._mut(c, p_m); off.append(c)
+            off_fit = [self.evaluate(c) for c in off]
+            comb = self.population + off; comb_fit = self.fitness + off_fit
+            fronts = non_dominated_sort(comb_fit)
+            np_, nf = [], []
+            for fr in fronts:
+                if len(np_) + len(fr) <= self.pop_size:
+                    for i in fr: np_.append(comb[i]); nf.append(comb_fit[i])
+                else:
+                    d = crowding_distance(comb_fit, fr)
+                    order = np.argsort(-d)
+                    rem = self.pop_size - len(np_)
+                    for i in order[:rem]:
+                        np_.append(comb[fr[i]]); nf.append(comb_fit[fr[i]])
+                    break
+            self.population, self.fitness = np_, nf
+            self._upd_arc()
+            if div < self.cfg.diversity_reset_threshold:
+                self._reset_arc(gen)
+            if (self.cfg.use_local_search
+                    and gen % self.cfg.local_search_frequency == 0):
+                nt = max(1, int(self.pop_size * self.cfg.local_search_top_proportion))
+                top = sorted(range(len(self.population)), key=lambda i: sum(self.fitness[i]))[:nt]
+                for i in top:
+                    im = self._ls(self.population[i])
+                    self.population[i] = im; self.fitness[i] = self.evaluate(im)
+            if (gen % stride == 0) or (gen == self.max_gen - 1):
+                hv = _compute_hv(np.array(self.fitness))
+                self.history['hypervolume'].append(hv)
+            self.history['diversity'].append(div)
+        fronts = non_dominated_sort(self.fitness)
+        idx = fronts[0] if fronts else []
+        pareto = [self.population[i] for i in idx]
+        pareto_fit = [self.fitness[i] for i in idx]
+        return {'population': pareto, 'fitness': pareto_fit,
+                'history': self.history, 'hypervolume': 0.0}
 
 
-class RandomInit:
-    def __init__(self, problem: FreightRoutingProblem):
-        self.problem = problem
-        self.name = "Random"
-        self.pop_size = 100
-    
-    def evaluate(self):
-        total_cost = 0
-        total_emissions = 0
-        best_cost = float('inf')
-        best_emissions = float('inf')
-        
-        for _ in range(self.pop_size):
-            ind = np.random.rand(self.problem.n_vars)
-            cost, emissions = self.problem.evaluate(ind)
-            total_cost += cost
-            total_emissions += emissions
-            if cost < best_cost:
-                best_cost = cost
-            if emissions < best_emissions:
-                best_emissions = emissions
-        
-        return {
-            'avg_cost': total_cost / self.pop_size,
-            'avg_emissions': total_emissions / self.pop_size,
-            'best_cost': best_cost,
-            'best_emissions': best_emissions
-        }
-
-
-class LatinHypercubeInit:
-    def __init__(self, problem: FreightRoutingProblem):
-        self.problem = problem
-        self.name = "Latin Hypercube"
-        self.pop_size = 100
-    
-    def evaluate(self):
-        total_cost = 0
-        total_emissions = 0
-        best_cost = float('inf')
-        best_emissions = float('inf')
-        
-        for _ in range(self.pop_size):
-            ind = np.random.rand(self.problem.n_vars)
-            for i in range(self.problem.n_vars):
-                stratum = np.random.randint(0, self.pop_size)
-                ind[i] = (stratum + np.random.random()) / self.pop_size
-            cost, emissions = self.problem.evaluate(ind)
-            total_cost += cost
-            total_emissions += emissions
-            if cost < best_cost:
-                best_cost = cost
-            if emissions < best_emissions:
-                best_emissions = emissions
-        
-        return {
-            'avg_cost': total_cost / self.pop_size,
-            'avg_emissions': total_emissions / self.pop_size,
-            'best_cost': best_cost,
-            'best_emissions': best_emissions
-        }
+def _epsilon_dominates(a, b, eps):
+    strictly_better = False
+    for ai, bi in zip(a, b):
+        if ai > bi + eps: return False
+        if ai < bi - eps: strictly_better = True
+    return strictly_better
 
 
 # ============================================================================
-# INITIALIZATION COMPARISON RUNNER
+# COMPETITORS
 # ============================================================================
+class NSGAII:
+    name = 'nsga2'
 
-class InitializationComparison:
-    def __init__(self, excel_path: str):
-        self.excel_path = excel_path
-        self.loader = PrinsExcelLoader(excel_path)
-        self.results = []
-    
-    def get_test_instances(self) -> List[str]:
-        all_sheets = self.loader.get_all_sheets()
-        valid_sheets = []
-        for sheet in all_sheets:
+    def __init__(self, problem, config):
+        self.problem = problem
+        self.pop_size = 100; self.max_gen = 100
+        self.n_var = problem.n_var
+        self.eta_c = 20.0; self.eta_m = 20.0
+        self.p_c = 0.9; self.p_m = 1.0 / max(self.n_var, 1)
+
+    def run(self):
+        pop = [np.random.uniform(0, 1, self.n_var) for _ in range(self.pop_size)]
+        fit = [self.problem.evaluate(p) for p in pop]
+        for _ in range(self.max_gen):
+            off = []
+            while len(off) < self.pop_size:
+                p1 = self._t(pop, fit); p2 = self._t(pop, fit)
+                c1, c2 = self._sbx(p1, p2)
+                off.append(self._mut(c1))
+                if len(off) < self.pop_size: off.append(self._mut(c2))
+            off_fit = [self.problem.evaluate(o) for o in off]
+            pop, fit = self._env(pop + off, fit + off_fit, self.pop_size)
+        fr = non_dominated_sort(fit); idx = fr[0] if fr else []
+        return {'population': [pop[i] for i in idx], 'fitness': [fit[i] for i in idx],
+                'history': {'hypervolume': []}, 'hypervolume': 0.0}
+
+    def _t(self, pop, fit, k=2):
+        idx = np.random.choice(len(pop), k, replace=False); b = idx[0]
+        for i in idx[1:]:
+            if _dominates(fit[i], fit[b]): b = i
+        return pop[b]
+
+    def _sbx(self, p1, p2):
+        if np.random.random() > self.p_c: return p1.copy(), p2.copy()
+        c1, c2 = p1.copy(), p2.copy()
+        for i in range(self.n_var):
+            if np.random.random() <= 0.5 and abs(p1[i] - p2[i]) > 1e-14:
+                y1, y2 = (p1[i], p2[i]) if p1[i] < p2[i] else (p2[i], p1[i])
+                yl, yu = 0.0, 1.0; r = np.random.random()
+                b = 1.0 + (2.0 * (y1 - yl) / (y2 - y1 + 1e-14))
+                a = 2.0 - b ** (-(self.eta_c + 1.0))
+                bq = (r * a) ** (1.0 / (self.eta_c + 1.0)) if r <= 1.0 / a else (1.0 / (2.0 - r * a)) ** (1.0 / (self.eta_c + 1.0))
+                c1i = 0.5 * ((y1 + y2) - bq * (y2 - y1))
+                b = 1.0 + (2.0 * (yu - y2) / (y2 - y1 + 1e-14))
+                a = 2.0 - b ** (-(self.eta_c + 1.0))
+                bq = (r * a) ** (1.0 / (self.eta_c + 1.0)) if r <= 1.0 / a else (1.0 / (2.0 - r * a)) ** (1.0 / (self.eta_c + 1.0))
+                c2i = 0.5 * ((y1 + y2) + bq * (y2 - y1))
+                c1i = np.clip(c1i, yl, yu); c2i = np.clip(c2i, yl, yu)
+                if np.random.random() <= 0.5: c1[i], c2[i] = c1i, c2i
+                else: c1[i], c2[i] = c2i, c1i
+        return c1, c2
+
+    def _mut(self, x):
+        y = x.copy(); yl, yu = 0.0, 1.0
+        d1 = (y - yl) / (yu - yl + 1e-14); d2 = (yu - y) / (yu - yl + 1e-14)
+        for i in range(self.n_var):
+            if np.random.random() <= self.p_m:
+                r = np.random.random(); mp = 1.0 / (self.eta_m + 1.0)
+                if r <= 0.5:
+                    xy = 1 - d1[i]; v = 2 * r + (1 - 2 * r) * (xy ** (self.eta_m + 1)); dq = v ** mp - 1
+                else:
+                    xy = 1 - d2[i]; v = 2 * (1 - r) + 2 * (r - 0.5) * (xy ** (self.eta_m + 1)); dq = 1 - v ** mp
+                y[i] = np.clip(y[i] + dq * (yu - yl), yl, yu)
+        return y
+
+    def _env(self, pop, fit, k):
+        fr = non_dominated_sort(fit); np_, nf = [], []
+        for f in fr:
+            if len(np_) + len(f) <= k:
+                for i in f: np_.append(pop[i]); nf.append(fit[i])
+            else:
+                d = crowding_distance(fit, f)
+                order = np.argsort(-d)
+                rem = k - len(np_)
+                for i in order[:rem]: np_.append(pop[f[i]]); nf.append(fit[f[i]])
+                break
+        return np_, nf
+
+
+class NSGAIII(NSGAII):
+    name = 'nsga3'
+
+    def __init__(self, problem, config):
+        super().__init__(problem, config)
+        self.ref = self._dirs()
+
+    def _dirs(self, p=12):
+        m = self.problem.n_obj; d = []
+        for c in combinations_with_replacement(range(p + 1), m):
+            if sum(c) == p: d.append([x / p for x in c])
+        d = np.array(d)
+        if len(d) > self.pop_size:
+            idx = np.random.choice(len(d), self.pop_size, replace=False)
+            d = d[idx]
+        return d
+
+    def _assoc(self, F, ideal):
+        F = np.array(F); Ft = F - ideal
+        fm = np.abs(Ft).max(axis=0); fm[fm < 1e-12] = 1.0
+        Fn = Ft / fm
+        R = self.ref / np.maximum(np.linalg.norm(self.ref, axis=1, keepdims=True), 1e-12)
+        D = np.zeros((len(Fn), len(R)))
+        for i, f in enumerate(Fn):
+            p = f @ R.T; pp = p[:, None] * R
+            D[i] = np.linalg.norm(f[None, :] - pp, axis=1)
+        return np.argmin(D, axis=1)
+
+    def _env(self, pop, fit, k):
+        fr = non_dominated_sort(fit); np_, nf = [], []
+        for f in fr:
+            if len(np_) + len(f) <= k:
+                for i in f: np_.append(pop[i]); nf.append(fit[i])
+            else:
+                ideal = np.min(np.array(nf if nf else fit), axis=0)
+                la = [fit[i] for i in f]
+                assoc = self._assoc(la, ideal)
+                if nf:
+                    an = self._assoc(nf, ideal)
+                    nc = np.bincount(an, minlength=len(self.ref))
+                else:
+                    nc = np.zeros(len(self.ref), dtype=int)
+                rem = k - len(np_); avail = list(range(len(f)))
+                while rem > 0 and avail:
+                    dw = [d for d in range(len(self.ref)) if d in assoc[avail]]
+                    if not dw: break
+                    mn = min(nc[d] for d in dw)
+                    cd = np.random.choice([d for d in dw if nc[d] == mn])
+                    ind = [i for i in avail if assoc[i] == cd]
+                    if not ind: break
+                    p = np.random.choice(ind)
+                    np_.append(pop[f[p]]); nf.append(fit[f[p]]); nc[cd] += 1
+                    avail.remove(p); rem -= 1
+                if rem > 0:
+                    sub_fit = [fit[f[i]] for i in avail]
+                    sub_idx = list(range(len(avail)))
+                    d = crowding_distance(sub_fit, sub_idx)
+                    for i in np.argsort(-d)[:rem]:
+                        np_.append(pop[f[avail[i]]]); nf.append(fit[f[avail[i]]])
+                break
+        return np_, nf
+
+
+class SPEA2(NSGAII):
+    name = 'spea2'
+
+    def __init__(self, problem, config):
+        super().__init__(problem, config)
+        self.arc_size = self.pop_size
+
+    def _sf(self, pop, fit):
+        n = len(fit)
+        if n == 0: return np.zeros(0)
+        F = np.array(fit, dtype=float)
+        less_equal = (F[None, :, :] >= F[:, None, :]).all(axis=-1)
+        strictly_less = (F[None, :, :] > F[:, None, :]).any(axis=-1)
+        dominates = less_equal & strictly_less
+        np.fill_diagonal(dominates, False)
+        strength = dominates.sum(axis=0)
+        raw = (dominates * strength[None, :]).sum(axis=1)
+        Fmin = F.min(axis=0); Fmax = F.max(axis=0)
+        rng = Fmax - Fmin; rng[rng < 1e-12] = 1.0
+        Fn = (F - Fmin) / rng
+        D = distance.cdist(Fn, Fn); np.fill_diagonal(D, np.inf)
+        k = int(np.sqrt(n))
+        kth = np.sort(D, axis=1)[:, min(k, n - 2)]
+        density = 1.0 / (kth + 2.0)
+        return raw + density
+
+    def _env(self, pop, fit, k):
+        n = len(pop); sf = self._sf(pop, fit)
+        nd = [i for i in range(n) if sf[i] < 1.0]
+        dom = [i for i in range(n) if sf[i] >= 1.0]
+        if len(nd) <= k:
+            sel = list(nd) + sorted(dom, key=lambda i: sf[i])[:k - len(nd)]
+        else:
+            sel = list(nd); F = np.array([fit[i] for i in sel])
+            Fmin = F.min(0); Fmax = F.max(0)
+            rng = Fmax - Fmin; rng[rng < 1e-12] = 1.0
+            Fn = (F - Fmin) / rng
+            while len(sel) > k:
+                D = distance.cdist(Fn, Fn); np.fill_diagonal(D, np.inf)
+                md = np.sort(D, axis=1)[:, 0]
+                rm = int(np.argmin(md)); sel.pop(rm); Fn = np.delete(Fn, rm, axis=0)
+        return [pop[i] for i in sel], [fit[i] for i in sel]
+
+    def run(self):
+        pop = [np.random.uniform(0, 1, self.n_var) for _ in range(self.pop_size)]
+        fit = [self.problem.evaluate(p) for p in pop]
+        arc, af = [], []
+        for _ in range(self.max_gen):
+            u = pop + arc; uf = fit + af
+            off = []
+            while len(off) < self.pop_size:
+                p1 = self._t(u, uf); p2 = self._t(u, uf)
+                c1, c2 = self._sbx(p1, p2)
+                off.append(self._mut(c1))
+                if len(off) < self.pop_size: off.append(self._mut(c2))
+            of = [self.problem.evaluate(o) for o in off]
+            u = pop + arc + off; uf = fit + af + of
+            pop, fit = self._env(u, uf, self.arc_size)
+            arc, af = pop, fit
+        fr = non_dominated_sort(fit); idx = fr[0] if fr else []
+        return {'population': [pop[i] for i in idx], 'fitness': [fit[i] for i in idx],
+                'history': {'hypervolume': []}, 'hypervolume': 0.0}
+
+
+class MOEAD(NSGAII):
+    name = 'moead'
+
+    def __init__(self, problem, config):
+        super().__init__(problem, config)
+        self.T = max(2, int(0.2 * self.pop_size)); self.nr = 2
+        self.W = self._weights()
+        D = distance.cdist(self.W, self.W)
+        self.nb = np.argsort(D, axis=1)[:, :self.T]
+
+    def _weights(self):
+        m = self.problem.n_obj; N = self.pop_size
+        if m == 3:
+            p = 1
+            while True:
+                d = [[x / p for x in c]
+                     for c in combinations_with_replacement(range(p + 1), m)
+                     if sum(c) == p]
+                if len(d) >= N: break
+                p += 1
+            d = np.array(d)
+            if len(d) > N:
+                d = d[np.random.choice(len(d), N, replace=False)]
+            return d
+        return np.random.dirichlet(np.ones(m), N)
+
+    def _tch(self, f, w, z):
+        return float(np.max(w * np.abs(np.array(f) - z)))
+
+    def run(self):
+        pop = [np.random.uniform(0, 1, self.n_var) for _ in range(self.pop_size)]
+        fit = [self.problem.evaluate(p) for p in pop]
+        z = np.min(np.array(fit), 0)
+        for _ in range(self.max_gen):
+            for i in range(self.pop_size):
+                k, l = np.random.choice(self.nb[i], 2, replace=False)
+                c = pop[i] + 0.5 * (pop[k] - pop[l])
+                c = np.clip(c, 0, 1) if np.random.random() < 0.5 else pop[i].copy()
+                c = self._mut(c); cf = self.problem.evaluate(c)
+                z = np.minimum(z, np.array(cf))
+                rep = 0
+                for j_idx in np.random.permutation(self.T):
+                    j = self.nb[i][j_idx]
+                    if self._tch(cf, self.W[j], z) < self._tch(fit[j], self.W[j], z):
+                        pop[j] = c.copy(); fit[j] = cf; rep += 1
+                        if rep >= self.nr: break
+        fr = non_dominated_sort(fit); idx = fr[0] if fr else []
+        return {'population': [pop[i] for i in idx], 'fitness': [fit[i] for i in idx],
+                'history': {'hypervolume': []}, 'hypervolume': 0.0}
+
+
+class RLNSGAII(NSGAII):
+    name = 'rl_nsgaii'
+
+    def __init__(self, problem, config):
+        super().__init__(problem, config)
+        self.q = np.zeros((5, 5))
+        self.params = [(0.9, 0.1), (0.8, 0.2), (0.7, 0.3), (0.6, 0.4), (0.5, 0.5)]
+
+    def _state(self, pop):
+        u = len(set(tuple(np.round(s, 4)) for s in pop))
+        return float(np.clip(u / max(1, len(pop)), 0, 1))
+
+    def run(self):
+        pop = [np.random.uniform(0, 1, self.n_var) for _ in range(self.pop_size)]
+        fit = [self.problem.evaluate(p) for p in pop]
+        for _ in range(self.max_gen):
+            s = int(np.clip(self._state(pop) * 5, 0, 4))
+            a = (np.random.randint(0, len(self.params))
+                 if np.random.random() < 0.1 else int(np.argmax(self.q[s])))
+            self.p_c, self.p_m = self.params[a]
+            off = []
+            while len(off) < self.pop_size:
+                p1 = self._t(pop, fit); p2 = self._t(pop, fit)
+                c1, c2 = self._sbx(p1, p2)
+                off.append(self._mut(c1))
+                if len(off) < self.pop_size: off.append(self._mut(c2))
+            of = [self.problem.evaluate(o) for o in off]
+            pop, fit = self._env(pop + off, fit + of, self.pop_size)
+            r = -float(np.mean([sum(f) for f in fit])) if fit else -1e6
+            ns = int(np.clip(self._state(pop) * 5, 0, 4))
+            self.q[s, a] += 0.1 * (r + 0.9 * np.max(self.q[ns]) - self.q[s, a])
+        fr = non_dominated_sort(fit); idx = fr[0] if fr else []
+        return {'population': [pop[i] for i in idx], 'fitness': [fit[i] for i in idx],
+                'history': {'hypervolume': []}, 'hypervolume': 0.0}
+
+
+# ============================================================================
+# METRICS
+# ============================================================================
+def _compute_hv(fit, ref=None, lo=None, n_samples=3000):
+    try:
+        F = np.asarray(fit, dtype=float)
+        F = F[np.all(np.isfinite(F) & (np.abs(F) < 1e12), axis=1)]
+        if len(F) == 0: return 0.0
+        m = F.shape[1]
+        if ref is None or lo is None:
+            ref = np.where(F.max(0) * 1.1 > 1e-9, F.max(0) * 1.1, 1.0)
+            lo = F.min(0)
+        ref = np.asarray(ref, dtype=float).flatten()[:m]
+        lo = np.asarray(lo, dtype=float).flatten()[:m]
+        span = ref - lo; span[span < 1e-12] = 1.0
+        Fn = (F - lo) / span
+        le = (Fn[None, :, :] >= Fn[:, None, :]).all(axis=-1)
+        sl = (Fn[None, :, :] > Fn[:, None, :]).any(axis=-1)
+        dom = le & sl
+        np.fill_diagonal(dom, False)
+        nd = Fn[~dom.any(axis=1)]
+        if len(nd) == 0: return 0.0
+        rng = np.random.default_rng(0)
+        pts = rng.uniform(0.0, 1.0, (n_samples, m))
+        inside = (pts[:, None, :] >= nd[None, :, :]).all(axis=2).any(axis=1)
+        return float(inside.mean())
+    except Exception:
+        return 0.0
+
+
+def compute_metrics_3obj(pareto_fit, ref=None, lo=None):
+    if pareto_fit is None or len(pareto_fit) == 0:
+        return {'hypervolume': 0.0, 'spacing': 0.0, 'cardinality': 0,
+                'best_cost': float('inf'), 'best_emission': float('inf'),
+                'best_time': float('inf')}
+    F = np.asarray(pareto_fit, dtype=float)
+    F = F[np.all(np.isfinite(F) & (np.abs(F) < 1e12), axis=1)]
+    if len(F) == 0:
+        return {'hypervolume': 0.0, 'spacing': 0.0, 'cardinality': 0,
+                'best_cost': float('inf'), 'best_emission': float('inf'),
+                'best_time': float('inf')}
+    hv = _compute_hv(F, ref=ref, lo=lo, n_samples=10000)
+    if len(F) > 1:
+        d = distance.cdist(F, F); np.fill_diagonal(d, np.inf)
+        md = d.min(axis=1); sp = float(np.std(md) / max(np.mean(md), 1e-10))
+    else:
+        sp = 0.0
+    return {'hypervolume': float(hv), 'spacing': sp, 'cardinality': int(len(F)),
+            'best_cost': float(F[:, 0].min()),
+            'best_emission': float(F[:, 1].min()),
+            'best_time': float(F[:, 2].min())}
+
+
+def summary_stats(data):
+    if not data:
+        return {'mean': 0, 'std': 0, 'median': 0, 'min': 0, 'max': 0,
+                'cv': 0, 'n': 0, 'ci95_low': 0, 'ci95_high': 0}
+    v = [x for x in data if np.isfinite(x)]
+    if not v:
+        return {'mean': 0, 'std': 0, 'median': 0, 'min': 0, 'max': 0,
+                'cv': 0, 'n': 0, 'ci95_low': 0, 'ci95_high': 0}
+    m = float(np.mean(v)); s = float(np.std(v, ddof=1)) if len(v) > 1 else 0.0
+    return {'mean': m, 'std': s, 'median': float(np.median(v)),
+            'min': float(np.min(v)), 'max': float(np.max(v)),
+            'cv': float(s / m) if m != 0 else 0.0, 'n': len(v),
+            'ci95_low': float(m - 1.96 * s / np.sqrt(len(v))) if len(v) > 1 else m,
+            'ci95_high': float(m + 1.96 * s / np.sqrt(len(v))) if len(v) > 1 else m}
+
+
+def cohens_d(a, b):
+    a = [x for x in a if np.isfinite(x)]; b = [x for x in b if np.isfinite(x)]
+    if len(a) < 2 or len(b) < 2: return 0.0
+    md = np.mean(a) - np.mean(b)
+    va = np.var(a, ddof=1); vb = np.var(b, ddof=1)
+    p = np.sqrt(((len(a) - 1) * va + (len(b) - 1) * vb) / (len(a) + len(b) - 2))
+    return float(md / p) if p > 0 else 0.0
+
+
+def interpret_d(d):
+    ad = abs(d)
+    if ad < 0.2: return "negligible"
+    if ad < 0.5: return "small"
+    if ad < 0.8: return "medium"
+    return "large"
+
+
+def cliffs_delta(a, b):
+    a = np.asarray([x for x in a if np.isfinite(x)], dtype=float)
+    b = np.asarray([x for x in b if np.isfinite(x)], dtype=float)
+    if len(a) == 0 or len(b) == 0: return 0.0
+    gt = (a[:, None] > b[None, :]).sum()
+    lt = (a[:, None] < b[None, :]).sum()
+    return float((gt - lt) / (len(a) * len(b)))
+
+
+# ============================================================================
+# EXPERIMENT RUNNER  (PART A only)
+# ============================================================================
+class BenchmarkRunner:
+    def __init__(self, config):
+        self.config = config
+        self.results = {}
+        self.fronts = {}
+        self.all_metrics = {}
+        self.all_det_metrics = {}
+        self.instances_loaded: List[PrinsInstance] = []
+        np.random.seed(config.base_seed)
+        random.seed(config.base_seed)
+
+    def get_algorithm(self, name, problem):
+        name = name.lower()
+        if name == 'dro_emo': return DROEMO(problem, self.config.dro_emo)
+        if name == 'nsga2': return NSGAII(problem, self.config)
+        if name == 'nsga3': return NSGAIII(problem, self.config)
+        if name == 'spea2': return SPEA2(problem, self.config)
+        if name == 'moead': return MOEAD(problem, self.config)
+        if name == 'rl_nsgaii': return RLNSGAII(problem, self.config)
+        raise ValueError(f"Unknown algorithm: {name}")
+
+    def run_instance(self, instance, algorithms, num_runs=None):
+        num_runs = num_runs or self.config.num_runs
+        problem = LCCLRP(instance)
+        results, fronts = {}, {}
+        metrics_by_alg, det_by_alg = {}, {}
+        per_run_fronts = {alg: [] for alg in algorithms}
+        per_run_det = {alg: [] for alg in algorithms}
+
+        for alg in algorithms:
+            log(f"    Running {alg} on {instance.name}...")
+            alg_fronts = []; alg_det = []
+            for run in range(num_runs):
+                seed = self.config.get_seed(run)
+                np.random.seed(seed); random.seed(seed)
+                try:
+                    algo = self.get_algorithm(alg, problem)
+                    result = algo.run()
+                except Exception as e:
+                    log(f"      [warn] {alg} run {run} failed: {e}")
+                    result = {'population': [], 'fitness': [], 'history': {}}
+                pop = result.get('population', [])
+                fit = (np.array(result['fitness'], dtype=float)
+                       if result['fitness'] else np.array([]))
+                det_fit = (np.array([problem.evaluate_deterministic(s) for s in pop])
+                           if pop else np.array([]))
+                alg_fronts.append(fit)
+                if len(det_fit) > 0:
+                    alg_det.append({
+                        'det_best_cost': float(det_fit[:, 0].min()),
+                        'det_best_emission': float(det_fit[:, 1].min()),
+                        'det_best_time': float(det_fit[:, 2].min()),
+                    })
+                else:
+                    alg_det.append({'det_best_cost': float('inf'),
+                                    'det_best_emission': float('inf'),
+                                    'det_best_time': float('inf')})
+            per_run_fronts[alg] = alg_fronts
+            per_run_det[alg] = alg_det
+
+        all_fronts = []
+        for alg in algorithms:
+            for f in per_run_fronts[alg]:
+                if f is not None and len(f) > 0: all_fronts.append(f)
+        if all_fronts:
+            pooled = np.vstack(all_fronts)
+            pooled = pooled[np.all(np.isfinite(pooled) & (np.abs(pooled) < 1e12), axis=1)]
+            if len(pooled) > 0:
+                global_ref = np.where(pooled.max(0) * 1.1 > 1e-9,
+                                      pooled.max(0) * 1.1, 1.0)
+                global_lo = pooled.min(0)
+            else:
+                global_ref = None; global_lo = None
+        else:
+            global_ref = None; global_lo = None
+
+        for alg in algorithms:
+            alg_metrics = [compute_metrics_3obj(fit, ref=global_ref, lo=global_lo)
+                           for fit in per_run_fronts[alg]]
+            hvs = [m['hypervolume'] for m in alg_metrics]
+            best = int(np.argmax(hvs)) if hvs else 0
+            fronts[alg] = per_run_fronts[alg][best] if per_run_fronts[alg] else np.array([])
+            metrics_by_alg[alg] = alg_metrics
+            det_by_alg[alg] = per_run_det[alg]
+
+        for alg in algorithms:
+            alg_metrics = metrics_by_alg[alg]
+            alg_det = det_by_alg[alg]
+            results[alg] = {'summary': {
+                'hypervolume': summary_stats([m['hypervolume'] for m in alg_metrics]),
+                'spacing': summary_stats([m['spacing'] for m in alg_metrics]),
+                'cardinality': summary_stats([m['cardinality'] for m in alg_metrics]),
+                'best_cost': summary_stats([m['best_cost'] for m in alg_metrics]),
+                'best_emission': summary_stats([m['best_emission'] for m in alg_metrics]),
+                'best_time': summary_stats([m['best_time'] for m in alg_metrics]),
+                'det_best_cost': summary_stats([m['det_best_cost'] for m in alg_det]),
+                'det_best_emission': summary_stats([m['det_best_emission'] for m in alg_det]),
+                'det_best_time': summary_stats([m['det_best_time'] for m in alg_det]),
+            }}
+            log(f"      HV(global ref): "
+                f"{results[alg]['summary']['hypervolume']['mean']:.4f} "
+                f"± {results[alg]['summary']['hypervolume']['std']:.4f}   "
+                f"Det-cost: {results[alg]['summary']['det_best_cost']['mean']:.4g}   "
+                f"Det-CO2: {results[alg]['summary']['det_best_emission']['mean']:.4g}")
+
+        self.results[instance.name] = results
+        self.fronts[instance.name] = fronts
+        self.all_metrics[instance.name] = metrics_by_alg
+        self.all_det_metrics[instance.name] = det_by_alg
+        return results
+
+    def run_all(self, instances, algorithms):
+        self.instances_loaded = instances
+        t0 = time.time()
+        for idx, inst in enumerate(instances, 1):
+            log(f"\n{'='*60}\nInstance {idx}/{len(instances)}: {inst.name} "
+                f"(depots={inst.n_depots}, customers={inst.n_customers})  "
+                f"[elapsed {time.time()-t0:.0f}s]\n{'='*60}")
             try:
-                instance = self.loader.load_instance(sheet)
-                if instance['n_depots'] > 0 and instance['n_customers'] >= 10:
-                    valid_sheets.append(sheet)
-            except:
-                pass
-        return valid_sheets[:10]
-    
-    def run_comparison(self, n_runs: int = 3):
-        methods = {
-            'PPO-Adaptive': PPOAdaptiveInit,
-            'Classic PPO': ClassicPPOInit,
-            'Random': RandomInit,
-            'Latin Hypercube': LatinHypercubeInit
-        }
-        
-        instances = self.get_test_instances()
-        
-        print("\n" + "="*80)
-        print(" PPO-ADAPTIVE INITIALIZATION COMPARISON ".center(80, "="))
-        print("="*80)
-        print(f"\nTesting {len(instances)} instances with {n_runs} runs each")
-        print(f"Methods: {list(methods.keys())}")
-        print("\nNOTE: Testing ONLY initialization quality (NO evolution)")
-        
-        for instance_name in instances:
-            print("\n" + "-"*60)
-            print(f"INSTANCE: {instance_name}")
-            print("-"*60)
-            
-            instance_data = self.loader.load_instance(instance_name)
-            print(f"  Depots: {instance_data['n_depots']}, Customers: {instance_data['n_customers']}")
-            print(f"  Green: {instance_data['is_green']}, Capacity: {instance_data['vehicle_capacity']}")
-            
-            for method_name, MethodClass in methods.items():
-                print(f"\n  Testing {method_name}...")
-                
-                costs = []
-                emissions = []
-                times = []
-                best_costs = []
-                best_emissions = []
-                
-                for run in range(n_runs):
-                    start = time.time()
-                    problem = FreightRoutingProblem(instance_data, carbon_price=500.0)
-                    init = MethodClass(problem)
-                    result = init.evaluate()
-                    elapsed = time.time() - start
-                    
-                    costs.append(result['avg_cost'])
-                    emissions.append(result['avg_emissions'])
-                    best_costs.append(result['best_cost'])
-                    best_emissions.append(result['best_emissions'])
-                    times.append(elapsed)
-                
-                self.results.append({
-                    'Instance': instance_name,
-                    'Method': method_name,
-                    'Mean_Cost': np.mean(costs),
-                    'Std_Cost': np.std(costs),
-                    'Mean_Emissions': np.mean(emissions),
-                    'Std_Emissions': np.std(emissions),
-                    'Mean_Best_Cost': np.mean(best_costs),
-                    'Std_Best_Cost': np.std(best_costs),
-                    'Mean_Best_Emissions': np.mean(best_emissions),
-                    'Std_Best_Emissions': np.std(best_emissions),
-                    'Mean_Time': np.mean(times),
-                    'Std_Time': np.std(times)
-                })
-                
-                print(f"    Avg Cost: ${np.mean(costs):.2f} ± {np.std(costs):.2f}")
-                print(f"    Avg CO₂: {np.mean(emissions):.1f} ± {np.std(emissions):.1f} kg")
-                print(f"    Best CO₂: {np.mean(best_emissions):.1f} ± {np.std(best_emissions):.1f} kg")
-        
-        return pd.DataFrame(self.results)
-    
-    def print_summary(self, results_df: pd.DataFrame):
-        print("\n" + "="*80)
-        print(" RESULTS SUMMARY ".center(80, "="))
-        print("="*80)
-        
-        print("\nOVERALL AVERAGES (across all instances):")
-        print("-"*60)
-        print(f"{'Method':<18} {'Avg CO₂ (kg)':<18} {'Best CO₂ (kg)':<18} {'Avg Cost ($)':<18}")
-        print("-"*60)
-        
-        for method in results_df['Method'].unique():
-            method_data = results_df[results_df['Method'] == method]
-            avg_emissions = method_data['Mean_Emissions'].mean()
-            best_emissions = method_data['Mean_Best_Emissions'].mean()
-            avg_cost = method_data['Mean_Cost'].mean()
-            print(f"{method:<18} {avg_emissions:<18.1f} {best_emissions:<18.1f} ${avg_cost:<17.2f}")
-        
-        print("\n" + "="*80)
-        print(" IMPROVEMENT OVER RANDOM INITIALIZATION ".center(80, "="))
-        print("="*80)
-        
-        random_avg = results_df[results_df['Method'] == 'Random']['Mean_Emissions'].mean()
-        random_best = results_df[results_df['Method'] == 'Random']['Mean_Best_Emissions'].mean()
-        
-        print(f"\n{'Method':<18} {'Avg CO₂ Improvement':<22} {'Best CO₂ Improvement':<22}")
-        print("-"*62)
-        
-        for method in results_df['Method'].unique():
-            if method != 'Random':
-                method_data = results_df[results_df['Method'] == method]
-                avg_emissions = method_data['Mean_Emissions'].mean()
-                best_emissions = method_data['Mean_Best_Emissions'].mean()
-                avg_imp = (random_avg - avg_emissions) / random_avg * 100
-                best_imp = (random_best - best_emissions) / random_best * 100
-                print(f"{method:<18} {avg_imp:<22.1f}% {best_imp:<22.1f}%")
-        
-        print("\n" + "="*80)
-        print(" PPO-ADAPTIVE vs CLASSIC PPO COMPARISON ".center(80, "="))
-        print("="*80)
-        
-        pa_data = results_df[results_df['Method'] == 'PPO-Adaptive']
-        classic_data = results_df[results_df['Method'] == 'Classic PPO']
-        
-        if len(pa_data) > 0 and len(classic_data) > 0:
-            pa_avg = pa_data['Mean_Emissions'].mean()
-            classic_avg = classic_data['Mean_Emissions'].mean()
-            pa_best = pa_data['Mean_Best_Emissions'].mean()
-            classic_best = classic_data['Mean_Best_Emissions'].mean()
-            
-            print(f"\n  PPO-Adaptive Avg CO₂: {pa_avg:.1f} kg")
-            print(f"  Classic PPO Avg CO₂:  {classic_avg:.1f} kg")
-            print(f"  → Improvement: {(classic_avg - pa_avg) / classic_avg * 100:.1f}% lower emissions")
-            
-            print(f"\n  PPO-Adaptive Best CO₂: {pa_best:.1f} kg")
-            print(f"  Classic PPO Best CO₂:  {classic_best:.1f} kg")
-            print(f"  → Improvement: {(classic_best - pa_best) / classic_best * 100:.1f}% lower emissions")
-        
-        # Add note about Cost Greedy removal
-        print("\n" + "="*80)
-        print(" NOTE ".center(80, "="))
-        print("="*80)
-        print("  → Validation showed it uses different evaluation logic.")
-        print("  → Including it would produce invalid comparisons.")
-    
-    def save_results(self, results_df: pd.DataFrame):
-        results_df.to_csv(OUTPUT_DIR / 'initialization_comparison_results.csv', index=False)
-        print(f"\n✓ Results saved to {OUTPUT_DIR / 'initialization_comparison_results.csv'}")
+                self.run_instance(inst, algorithms)
+            except KeyboardInterrupt:
+                log("  Interrupted by user — saving partial results.")
+                raise
+            except Exception as e:
+                log(f"  ERROR on {inst.name}: {e}")
+                import traceback; traceback.print_exc(); continue
+        return self.results
 
+    def statistical_analysis(self, reference_alg='dro_emo'):
+        rep = {}
+        for inst_name, alg_metrics in self.all_metrics.items():
+            rep[inst_name] = {}
+            hv_samples = {alg: [m['hypervolume'] for m in metrics]
+                          for alg, metrics in alg_metrics.items()}
+            try:
+                kw_s, kw_p = stats.kruskal(*list(hv_samples.values()))
+            except Exception:
+                kw_s, kw_p = 0.0, 1.0
+            rep[inst_name]['kruskal_wallis_hv'] = {
+                'statistic': float(kw_s), 'p_value': float(kw_p),
+                'significant': bool(kw_p < 0.05)}
+            ref_hv = hv_samples[reference_alg]
+            for other, other_hv in hv_samples.items():
+                if other == reference_alg: continue
+                try:
+                    u_s, u_p = stats.mannwhitneyu(ref_hv, other_hv,
+                                                  alternative='two-sided')
+                except Exception:
+                    u_s, u_p = 0.0, 1.0
+                d = cohens_d(ref_hv, other_hv)
+                cd = cliffs_delta(ref_hv, other_hv)
+                rep[inst_name][f'{reference_alg}_vs_{other}'] = {
+                    'mann_whitney_U': float(u_s), 'p_value': float(u_p),
+                    'significant': bool(u_p < 0.05),
+                    'cohens_d': float(d), 'effect_size': interpret_d(d),
+                    'cliffs_delta': float(cd),
+                    'mean_ref': float(np.mean(ref_hv)) if ref_hv else 0.0,
+                    'mean_other': float(np.mean(other_hv)) if other_hv else 0.0}
+            det_metrics = self.all_det_metrics.get(inst_name, {})
+            if reference_alg in det_metrics:
+                ref_cost = [m['det_best_cost'] for m in det_metrics[reference_alg]]
+                ref_co2 = [m['det_best_emission'] for m in det_metrics[reference_alg]]
+                for other in det_metrics:
+                    if other == reference_alg: continue
+                    other_cost = [m['det_best_cost'] for m in det_metrics[other]]
+                    other_co2 = [m['det_best_emission'] for m in det_metrics[other]]
+                    n = min(len(ref_cost), len(other_cost))
+                    try:
+                        w_s, w_p = stats.wilcoxon(ref_cost[:n], other_cost[:n],
+                                                  alternative='two-sided')
+                    except Exception:
+                        w_s, w_p = 0.0, 1.0
+                    try:
+                        w_s2, w_p2 = stats.wilcoxon(ref_co2[:n], other_co2[:n],
+                                                    alternative='two-sided')
+                    except Exception:
+                        w_s2, w_p2 = 0.0, 1.0
+                    rep[inst_name][f'{reference_alg}_vs_{other}_det'] = {
+                        'wilcoxon_cost_stat': float(w_s),
+                        'wilcoxon_cost_p': float(w_p),
+                        'wilcoxon_co2_stat': float(w_s2),
+                        'wilcoxon_co2_p': float(w_p2),
+                        'mean_ref_cost': float(np.mean(ref_cost)) if ref_cost else 0.0,
+                        'mean_other_cost': float(np.mean(other_cost)) if other_cost else 0.0,
+                        'mean_ref_co2': float(np.mean(ref_co2)) if ref_co2 else 0.0,
+                        'mean_other_co2': float(np.mean(other_co2)) if other_co2 else 0.0}
+        return rep
 
-# ============================================================================
-# VISUALIZATION CLASS
-# ============================================================================
+    def _safe(self, fn, *a, **kw):
+        try: fn(*a, **kw)
+        except Exception as e:
+            log(f"    [warn] {fn.__name__} failed: {type(e).__name__}: {e}")
 
-class Visualization:
-    def __init__(self, results_df: pd.DataFrame, output_dir: Path):
-        self.results_df = results_df
-        self.output_dir = output_dir
-        self.plots_dir = output_dir / "plots"
-        self.plots_dir.mkdir(exist_ok=True)
-    
-    def plot_bar_chart(self):
-        """Bar chart comparing mean emissions across methods"""
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        method_means = self.results_df.groupby('Method')['Mean_Emissions'].mean().sort_values()
-        colors = [METHOD_COLORS.get(m, '#95a5a6') for m in method_means.index]
-        
-        bars = ax.barh(range(len(method_means)), method_means.values, color=colors, 
-                      edgecolor='black', alpha=0.8)
-        
-        ax.set_yticks(range(len(method_means)))
-        ax.set_yticklabels(method_means.index)
-        ax.set_xlabel('Mean CO₂ Emissions (kg)', fontsize=12, fontweight='bold')
-        ax.set_title('Initialization Quality: Average CO₂ Emissions', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3, axis='x')
-        
-        for i, (bar, val) in enumerate(zip(bars, method_means.values)):
-            ax.text(val + 2, bar.get_y() + bar.get_height()/2, f'{val:.1f} kg', 
-                   va='center', fontsize=9, fontweight='bold')
-        
+    def generate_report(self, output_dir, stats_report):
+        os.makedirs(output_dir, exist_ok=True)
+        stat_dir = os.path.join(output_dir, 'statistics')
+        os.makedirs(stat_dir, exist_ok=True)
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        serializable = {'summary': self._serialize(self.results),
+                        'statistics': self._serialize(stats_report)}
+        with open(os.path.join(output_dir, f'results_{ts}.json'), 'w') as f:
+            json.dump(serializable, f, indent=2)
+        self._safe(self._write_summary_tables, output_dir)
+        self._safe(self._write_statistics_tables, output_dir, stats_report)
+        self._safe(self._plot_heatmap, output_dir, stat_dir)
+        self._safe(self._plot_instance_level_boxplots, stat_dir)
+        log(f"\nReport generated in {output_dir}")
+
+    def _write_summary_tables(self, output_dir):
+        lines = ["=" * 140,
+                 "PER-INSTANCE SUMMARY — HYPERVOLUME (global, normalized ref in [0,1])",
+                 "=" * 140,
+                 f"{'Instance':<14} {'Algorithm':<12} {'Rel.HV':<8} "
+                 f"{'HV mean':<12} {'HV std':<12} "
+                 f"{'Det cost':<14} {'Det CO2':<12} {'Det time':<12}",
+                 "-" * 140]
+        for inst, alg_results in sorted(self.results.items()):
+            hv_means = {alg: r['summary']['hypervolume']['mean']
+                        for alg, r in alg_results.items()}
+            best_hv = max(hv_means.values()) if hv_means else 1.0
+            best_hv = best_hv if best_hv > 0 else 1.0
+            for alg, r in sorted(alg_results.items(),
+                                 key=lambda x: -x[1]['summary']['hypervolume']['mean']):
+                s = r['summary']
+                rel_hv = s['hypervolume']['mean'] / best_hv
+                lines.append(
+                    f"{inst:<14} {alg:<12} "
+                    f"{rel_hv:<8.4f} "
+                    f"{s['hypervolume']['mean']:<12.4f} "
+                    f"{s['hypervolume']['std']:<12.4f} "
+                    f"{s['det_best_cost']['mean']:<14.4g} "
+                    f"{s['det_best_emission']['mean']:<12.4g} "
+                    f"{s['det_best_time']['mean']:<12.4g}")
+            lines.append("-" * 140)
+        txt = '\n'.join(lines)
+        log(txt)
+        with open(os.path.join(output_dir, 'summary_table.txt'), 'w') as f:
+            f.write(txt)
+
+    def _write_statistics_tables(self, output_dir, stats_report):
+        lines = ["=" * 140,
+                 "STATISTICAL VALIDATION (HV normalized, Mann-Whitney U vs DRO-EMO)",
+                 "=" * 140,
+                 f"{'Instance':<14} {'Comparison':<24} {'p-value':<12} "
+                 f"{'Signif.':<8} {'Cohen d':<10} {'Effect':<10} {'Cliff d':<10}",
+                 "-" * 140]
+        for inst, rep in stats_report.items():
+            for key, val in rep.items():
+                if key.startswith('kruskal'): continue
+                if key.endswith('_det'): continue
+                lines.append(
+                    f"{inst:<14} {key:<24} {val['p_value']:<12.4g} "
+                    f"{str(val['significant']):<8} {val['cohens_d']:<10.4f} "
+                    f"{val['effect_size']:<10} {val['cliffs_delta']:<10.3f}")
+            lines.append("-" * 140)
+        txt = '\n'.join(lines)
+        with open(os.path.join(output_dir, 'statistics_table.txt'), 'w') as f:
+            f.write(txt)
+        log("  [ok] statistics_table.txt")
+
+        lines2 = ["=" * 140,
+                  "PAIRED WILCOXON ON DETERMINISTIC METRICS (DRO-EMO vs each)",
+                  "=" * 140,
+                  f"{'Instance':<14} {'Comparison':<24} {'p(cost)':<12} "
+                  f"{'p(CO2)':<12} {'Ref cost':<14} {'Other cost':<14} "
+                  f"{'Ref CO2':<12} {'Other CO2':<12}",
+                  "-" * 140]
+        for inst, rep in stats_report.items():
+            for key, val in rep.items():
+                if not key.endswith('_det'): continue
+                lines2.append(
+                    f"{inst:<14} {key[:-4]:<24} "
+                    f"{val['wilcoxon_cost_p']:<12.4g} "
+                    f"{val['wilcoxon_co2_p']:<12.4g} "
+                    f"{val['mean_ref_cost']:<14.4g} "
+                    f"{val['mean_other_cost']:<14.4g} "
+                    f"{val['mean_ref_co2']:<12.4g} "
+                    f"{val['mean_other_co2']:<12.4g}")
+            lines2.append("-" * 140)
+        with open(os.path.join(output_dir, 'paired_wilcoxon_det.txt'), 'w') as f:
+            f.write('\n'.join(lines2))
+        log("  [ok] paired_wilcoxon_det.txt")
+
+    def _plot_heatmap(self, output_dir, stat_dir):
+        instances = sorted(self.results.keys())
+        if not instances: return
+        algs = sorted(self.results[instances[0]].keys())
+        M = np.zeros((len(instances), len(algs)))
+        for i, inst in enumerate(instances):
+            for j, alg in enumerate(algs):
+                M[i, j] = self.results[inst][alg]['summary']['hypervolume']['mean']
+        rmax = M.max(axis=1, keepdims=True); rmax[rmax == 0] = 1.0
+        Mn = M / rmax
+        fig, ax = plt.subplots(figsize=(10, max(6, 0.4 * len(instances))))
+        im = ax.imshow(Mn, cmap=_get_cmap('RdYlGn'), aspect='auto', vmin=0, vmax=1)
+        ax.set_xticks(range(len(algs)))
+        ax.set_xticklabels(algs, rotation=45, ha='right')
+        ax.set_yticks(range(len(instances))); ax.set_yticklabels(instances)
+        plt.colorbar(im, ax=ax, label='Normalized HV (global ref, in [0,1])')
+        ax.set_title('HV Heatmap (global reference, per-instance normalized)',
+                     fontweight='bold')
         plt.tight_layout()
-        plt.savefig(self.plots_dir / 'bar_chart_emissions.pdf', bbox_inches='tight', dpi=300)
-        plt.savefig(self.plots_dir / 'bar_chart_emissions.png', bbox_inches='tight', dpi=300)
-        plt.close()
-        print("  ✓ Saved: bar_chart_emissions.pdf/png")
-    
-    def plot_best_emissions_chart(self):
-        """Bar chart comparing best emissions across methods"""
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        method_means = self.results_df.groupby('Method')['Mean_Best_Emissions'].mean().sort_values()
-        colors = [METHOD_COLORS.get(m, '#95a5a6') for m in method_means.index]
-        
-        bars = ax.barh(range(len(method_means)), method_means.values, color=colors, 
-                      edgecolor='black', alpha=0.8)
-        
-        ax.set_yticks(range(len(method_means)))
-        ax.set_yticklabels(method_means.index)
-        ax.set_xlabel('Best CO₂ Emissions (kg)', fontsize=12, fontweight='bold')
-        ax.set_title('Initialization Quality: Best CO₂ Emissions', fontsize=14, fontweight='bold')
-        ax.grid(True, alpha=0.3, axis='x')
-        
-        for i, (bar, val) in enumerate(zip(bars, method_means.values)):
-            ax.text(val + 2, bar.get_y() + bar.get_height()/2, f'{val:.1f} kg', 
-                   va='center', fontsize=9, fontweight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(self.plots_dir / 'bar_chart_best_emissions.pdf', bbox_inches='tight', dpi=300)
-        plt.savefig(self.plots_dir / 'bar_chart_best_emissions.png', bbox_inches='tight', dpi=300)
-        plt.close()
-        print("  ✓ Saved: bar_chart_best_emissions.pdf/png")
-    
-    def plot_improvement_chart(self):
-        """Bar chart showing improvement over random initialization"""
+        plt.savefig(os.path.join(stat_dir, 'heatmap.png'), dpi=200,
+                    bbox_inches='tight'); plt.close(fig)
+        log("  [ok] heatmap.png")
+
+    def _plot_instance_level_boxplots(self, stat_dir):
         fig, ax = plt.subplots(figsize=(12, 6))
-        
-        random_avg = self.results_df[self.results_df['Method'] == 'Random']['Mean_Emissions'].mean()
-        
-        improvements = []
-        methods = []
-        
-        for method in self.results_df['Method'].unique():
-            if method != 'Random':
-                method_avg = self.results_df[self.results_df['Method'] == method]['Mean_Emissions'].mean()
-                improvement = (random_avg - method_avg) / random_avg * 100
-                improvements.append(improvement)
-                methods.append(method)
-        
-        sorted_idx = np.argsort(improvements)[::-1]
-        methods = [methods[i] for i in sorted_idx]
-        improvements = [improvements[i] for i in sorted_idx]
-        colors = [METHOD_COLORS.get(m, '#95a5a6') for m in methods]
-        
-        bars = ax.bar(range(len(methods)), improvements, color=colors, edgecolor='black', alpha=0.8)
-        ax.set_xticks(range(len(methods)))
-        ax.set_xticklabels(methods, rotation=45, ha='right')
-        ax.set_ylabel('Improvement over Random (%)', fontsize=12, fontweight='bold')
-        ax.set_title('Emission Reduction vs Random Initialization', fontsize=14, fontweight='bold')
-        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax.grid(True, alpha=0.3, axis='y')
-        
-        for bar, imp in zip(bars, improvements):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                   f'{imp:.1f}%', ha='center', fontweight='bold')
-        
-        # Highlight PPO-Adaptive bar
-        for i, method in enumerate(methods):
-            if method == 'PPO-Adaptive':
-                bars[i].set_edgecolor('black')
-                bars[i].set_linewidth(2)
-        
+        data_by_alg = {}
+        for inst, alg_results in self.results.items():
+            for alg, r in alg_results.items():
+                data_by_alg.setdefault(alg, []).append(
+                    r['summary']['hypervolume']['mean'])
+        names = list(data_by_alg.keys())
+        vals = [[v for v in data_by_alg[n] if np.isfinite(v)] for n in names]
+        valid = [(n, v) for n, v in zip(names, vals) if v]
+        if valid:
+            names, vals = zip(*valid)
+            bp = ax.boxplot(vals, patch_artist=True, showmeans=True)
+            ax.set_xticklabels(names, rotation=45, ha='right')
+            for p, c in zip(bp['boxes'], _tab_colors(len(names))):
+                p.set_facecolor(c); p.set_alpha(0.7)
+            ax.set_ylabel('Mean HV per instance (global ref, in [0,1])')
+            ax.set_title('HV Distribution Across Prins Instances', fontweight='bold')
+            ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(self.plots_dir / 'improvement_chart.pdf', bbox_inches='tight', dpi=300)
-        plt.savefig(self.plots_dir / 'improvement_chart.png', bbox_inches='tight', dpi=300)
-        plt.close()
-        print("  ✓ Saved: improvement_chart.pdf/png")
-    
-    def plot_radar_chart(self):
-        """Radar chart comparing multi-criteria performance"""
-        fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection='polar'))
-        
-        metrics = ['Avg Emissions', 'Best Emissions', 'Avg Cost', 'Speed']
-        
-        method_performance = {}
-        
-        for method in self.results_df['Method'].unique():
-            method_data = self.results_df[self.results_df['Method'] == method]
-            
-            max_val = self.results_df['Mean_Emissions'].max()
-            min_val = self.results_df['Mean_Emissions'].min()
-            emissions_norm = 1 - (method_data['Mean_Emissions'].mean() - min_val) / (max_val - min_val + 1e-10)
-            
-            max_val = self.results_df['Mean_Best_Emissions'].max()
-            min_val = self.results_df['Mean_Best_Emissions'].min()
-            best_norm = 1 - (method_data['Mean_Best_Emissions'].mean() - min_val) / (max_val - min_val + 1e-10)
-            
-            max_val = self.results_df['Mean_Cost'].max()
-            min_val = self.results_df['Mean_Cost'].min()
-            cost_norm = 1 - (method_data['Mean_Cost'].mean() - min_val) / (max_val - min_val + 1e-10)
-            
-            max_val = self.results_df['Mean_Time'].max()
-            min_val = self.results_df['Mean_Time'].min()
-            time_norm = 1 - (method_data['Mean_Time'].mean() - min_val) / (max_val - min_val + 1e-10)
-            
-            method_performance[method] = [emissions_norm, best_norm, cost_norm, time_norm]
-        
-        angles = np.linspace(0, 2 * np.pi, len(metrics), endpoint=False).tolist()
-        angles += angles[:1]
-        
-        for method, values in method_performance.items():
-            values += values[:1]
-            ax.plot(angles, values, 'o-', linewidth=2, 
-                   color=METHOD_COLORS.get(method, '#333'), label=method)
-            ax.fill(angles, values, alpha=0.1, color=METHOD_COLORS.get(method, '#333'))
-        
-        ax.set_xticks(angles[:-1])
-        ax.set_xticklabels(metrics, fontsize=11, fontweight='bold')
-        ax.set_ylim(0, 1)
-        ax.set_title('Initialization Quality Radar Chart\n(Higher = Better)', fontsize=14, fontweight='bold', pad=20)
-        ax.legend(loc='upper right', bbox_to_anchor=(1.3, 1.0), fontsize=9)
-        ax.grid(True)
-        
-        plt.tight_layout()
-        plt.savefig(self.plots_dir / 'radar_chart.pdf', bbox_inches='tight', dpi=300)
-        plt.savefig(self.plots_dir / 'radar_chart.png', bbox_inches='tight', dpi=300)
-        plt.close()
-        print("  ✓ Saved: radar_chart.pdf/png")
-    
-    def create_summary_dashboard(self):
-        """Create a comprehensive summary dashboard"""
-        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-        
-        # 1. Avg Emissions ranking
-        ax1 = axes[0, 0]
-        method_means = self.results_df.groupby('Method')['Mean_Emissions'].mean().sort_values()
-        colors = [METHOD_COLORS.get(m, '#95a5a6') for m in method_means.index]
-        bars = ax1.barh(range(len(method_means)), method_means.values, color=colors, edgecolor='black', alpha=0.8)
-        ax1.set_yticks(range(len(method_means)))
-        ax1.set_yticklabels(method_means.index)
-        ax1.set_xlabel('Mean CO₂ Emissions (kg)', fontsize=11, fontweight='bold')
-        ax1.set_title('Average Emissions (Lower is Better)', fontsize=12, fontweight='bold')
-        ax1.grid(True, alpha=0.3, axis='x')
-        for i, (bar, val) in enumerate(zip(bars, method_means.values)):
-            ax1.text(val + 2, bar.get_y() + bar.get_height()/2, f'{val:.1f}', va='center', fontweight='bold')
-        
-        # 2. Best Emissions ranking
-        ax2 = axes[0, 1]
-        method_means = self.results_df.groupby('Method')['Mean_Best_Emissions'].mean().sort_values()
-        colors = [METHOD_COLORS.get(m, '#95a5a6') for m in method_means.index]
-        bars = ax2.barh(range(len(method_means)), method_means.values, color=colors, edgecolor='black', alpha=0.8)
-        ax2.set_yticks(range(len(method_means)))
-        ax2.set_yticklabels(method_means.index)
-        ax2.set_xlabel('Best CO₂ Emissions (kg)', fontsize=11, fontweight='bold')
-        ax2.set_title('Best Emissions (Lower is Better)', fontsize=12, fontweight='bold')
-        ax2.grid(True, alpha=0.3, axis='x')
-        for i, (bar, val) in enumerate(zip(bars, method_means.values)):
-            ax2.text(val + 2, bar.get_y() + bar.get_height()/2, f'{val:.1f}', va='center', fontweight='bold')
-        
-        # 3. Improvement chart
-        ax3 = axes[1, 0]
-        random_avg = self.results_df[self.results_df['Method'] == 'Random']['Mean_Emissions'].mean()
-        improvements = []
-        methods = []
-        for method in self.results_df['Method'].unique():
-            if method != 'Random':
-                method_avg = self.results_df[self.results_df['Method'] == method]['Mean_Emissions'].mean()
-                improvements.append((random_avg - method_avg) / random_avg * 100)
-                methods.append(method)
-        sorted_idx = np.argsort(improvements)[::-1]
-        methods = [methods[i] for i in sorted_idx]
-        improvements = [improvements[i] for i in sorted_idx]
-        colors = [METHOD_COLORS.get(m, '#95a5a6') for m in methods]
-        bars = ax3.bar(range(len(methods)), improvements, color=colors, edgecolor='black', alpha=0.8)
-        ax3.set_xticks(range(len(methods)))
-        ax3.set_xticklabels(methods, rotation=45, ha='right')
-        ax3.set_ylabel('Improvement over Random (%)', fontsize=11, fontweight='bold')
-        ax3.set_title('Emission Reduction vs Random', fontsize=12, fontweight='bold')
-        ax3.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
-        ax3.grid(True, alpha=0.3, axis='y')
-        for bar, imp in zip(bars, improvements):
-            ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1, f'{imp:.1f}%', ha='center', fontweight='bold')
-        
-        # 4. Summary table
-        ax4 = axes[1, 1]
-        ax4.axis('off')
-        
-        summary_text = "INITIALIZATION QUALITY SUMMARY\n"
-        summary_text += "(Cost Greedy Removed - Invalid Evaluation)\n\n"
-        for method in ['PPO-Adaptive', 'Classic PPO', 'Random', 'Latin Hypercube']:
-            method_data = self.results_df[self.results_df['Method'] == method]
-            if len(method_data) > 0:
-                summary_text += f"{method}:\n"
-                summary_text += f"  • Avg CO₂: {method_data['Mean_Emissions'].mean():.1f} kg\n"
-                summary_text += f"  • Best CO₂: {method_data['Mean_Best_Emissions'].mean():.1f} kg\n"
-                summary_text += f"  • Avg Cost: ${method_data['Mean_Cost'].mean():,.0f}\n\n"
-        
-        ax4.text(0.1, 0.9, summary_text, transform=ax4.transAxes, fontsize=10, 
-                verticalalignment='top', fontfamily='monospace')
-        
-        plt.suptitle('Initialization Methods Comparison Dashboard\n(without Cost Greedy)', fontsize=16, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(self.plots_dir / 'summary_dashboard.pdf', bbox_inches='tight', dpi=300)
-        plt.savefig(self.plots_dir / 'summary_dashboard.png', bbox_inches='tight', dpi=300)
-        plt.close()
-        print("  ✓ Saved: summary_dashboard.pdf/png")
-    
-    def create_all_plots(self):
-        """Generate all visualization plots"""
-        print("\n" + "="*80)
-        print(" GENERATING VISUALIZATIONS ".center(80, "="))
-        print("="*80)
-        
-        self.plot_bar_chart()
-        self.plot_best_emissions_chart()
-        self.plot_improvement_chart()
-        self.plot_radar_chart()
-        self.create_summary_dashboard()
-        
-        print(f"\n✓ All plots saved to: {self.plots_dir}")
+        plt.savefig(os.path.join(stat_dir, 'instance_level_boxplots.png'),
+                    dpi=200, bbox_inches='tight'); plt.close(fig)
+        log("  [ok] instance_level_boxplots.png")
+
+    @staticmethod
+    def _serialize(obj):
+        if isinstance(obj, np.integer): return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj) if np.isfinite(obj) else None
+        if isinstance(obj, np.ndarray): return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: BenchmarkRunner._serialize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [BenchmarkRunner._serialize(v) for v in obj]
+        if isinstance(obj, float):
+            return obj if np.isfinite(obj) else None
+        if isinstance(obj, (int, str, bool)) or obj is None: return obj
+        return str(obj)
 
 
 # ============================================================================
 # MAIN
 # ============================================================================
+def _parse_args():
+    parser = argparse.ArgumentParser(description="DRO-EMO Prins benchmark")
+    parser.add_argument("--smoke", action="store_true")
+    parser.add_argument("--runs", type=int, default=30)
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        in_notebook = 'ipykernel' in sys.modules or 'IPython' in sys.modules
+        if not in_notebook:
+            print(f"[args] Ignoring unrecognized arguments: {unknown}", flush=True)
+    return args
+
 
 def main():
-    print("\n" + "█"*100)
-    print(" PPO-ADAPTIVE INITIALIZATION COMPARISON (COST GREEDY REMOVED) ".center(100, "█"))
-    print("█"*100)
-    print("\nComparing INITIALIZATION quality only (NO evolution, NO optimization)")
-    print("\nMethods:")
-    print("  1. PPO-Adaptive - size-adaptive, ensemble, 4 strategies (PROPOSED)")
-    print("  2. Classic PPO - fixed parameters, single strategy")
-    print("  3. Random - baseline")
-    print("  4. Latin Hypercube - stratified sampling")
+    args = _parse_args()
+    print("=" * 90, flush=True)
+    print("DRO-EMO: Prins Routing Benchmark (PART A)", flush=True)
+    print("=" * 90, flush=True)
+    if not os.path.isfile(INPUT_EXCEL):
+        print("\nERROR: Input Excel file not found.", flush=True); return
 
-    if not EXCEL_PATH.exists():
-        print(f"\n❌ Excel file not found at: {EXCEL_PATH}")
-        return
-    
-    comparator = InitializationComparison(str(EXCEL_PATH))
-    results_df = comparator.run_comparison(n_runs=3)
-    comparator.print_summary(results_df)
-    comparator.save_results(results_df)
-    
-    viz = Visualization(results_df, OUTPUT_DIR)
-    viz.create_all_plots()
-    
-    print("\n" + "="*80)
-    print(" COMPARISON COMPLETED ".center(80, "="))
-    print("="*80)
-    print(f"\n📁 Results saved to: {OUTPUT_DIR}")
-    print(f"📁 Plots saved to: {PLOTS_DIR}")
-    print("\n📁 Files in manuscript folder:")
-    print(f"   - {OUTPUT_DIR / 'initialization_comparison_results.csv'}")
-    print(f"   - {PLOTS_DIR}/*.pdf (5 visualization files)")
+    print("\nLoading instances...", flush=True)
+    instances = load_prins_instances(INPUT_EXCEL)
+    print(f"Loaded {len(instances)} instances.", flush=True)
+    if not instances:
+        print("\nERROR: No usable instances.", flush=True); return
+
+    config = ExperimentConfig()
+    if args.smoke:
+        names = ['20-5-1a', '50-5-2ab', '100-5-1ab']
+        instances = [i for i in instances if i.name in names]
+        config.num_runs = 5
+        print(f"\n[smoke] {len(instances)} instances × {config.num_runs} runs",
+              flush=True)
+    else:
+        config.num_runs = args.runs
+        print(f"\n[full] {len(instances)} instances × {config.num_runs} runs",
+              flush=True)
+
+    algorithms = ['dro_emo', 'nsga2', 'nsga3', 'spea2', 'moead', 'rl_nsgaii']
+    runner = BenchmarkRunner(config)
+
+    log("\n" + "#" * 70)
+    log("# PART A — MAIN BENCHMARK")
+    log("#" * 70)
+    t_start = time.time()
+    try:
+        runner.run_all(instances, algorithms)
+    except KeyboardInterrupt:
+        print("\n[interrupted] Saving partial results...", flush=True)
+
+    print("\n" + "=" * 60, flush=True)
+    print("Statistical analysis", flush=True)
+    print("=" * 60, flush=True)
+    try:
+        stats_report = runner.statistical_analysis(reference_alg='dro_emo')
+    except Exception as e:
+        print(f"[warn] statistical analysis failed: {e}", flush=True)
+        stats_report = {}
+
+    os.makedirs(OUTPUT_BASE_DIR, exist_ok=True)
+    runner.generate_report(OUTPUT_BASE_DIR, stats_report)
+
+    elapsed = time.time() - t_start
+    print("\n" + "=" * 90, flush=True)
+    print(f"COMPLETED in {elapsed/60:.1f} minutes", flush=True)
+    print("=" * 90, flush=True)
+    print(f"Output: {OUTPUT_BASE_DIR}", flush=True)
 
 
 if __name__ == "__main__":
